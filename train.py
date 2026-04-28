@@ -67,11 +67,10 @@ class ARWLinear(nn.Module):
             self.bias = None
 
         # Learnable low‑rank adapter
+        # Zero‑initialised adapter (so forward pass = original model at start)
         self.B = nn.Parameter(torch.zeros(self.out_features, adapter_rank, device=device))
         self.A = nn.Parameter(torch.zeros(adapter_rank, self.in_features, device=device))
-        # Random init (scaled) to break symmetry
-        nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        # No random init – must be zero to keep core unchanged initially
 
     def _shell_projection(self, dW: torch.Tensor) -> torch.Tensor:
         """Project ΔW into the orthogonal complement of the core subspace."""
@@ -220,10 +219,21 @@ def main():
     print(f"Converting to ARW (core_rank={args.core_rank}, adapter_rank={args.adapter_rank}) ...")
     ARWLinear.convert_gpt2_layers(model, args.core_rank, args.adapter_rank, device)
 
-    # Freeze all non‑adapter parameters (W0, biases, embeddings, etc.)
-    for name, param in model.named_parameters():
-        if not (name.endswith('.B') or name.endswith('.A')):
-            param.requires_grad = False
+    # Freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze only ARW adapters
+    for module in model.modules():
+        if isinstance(module, ARWLinear):
+            module.A.requires_grad = True
+            module.B.requires_grad = True
+
+    # Sanity check: verify we have trainable parameters
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    print(f"Found {len(trainable)} trainable parameters (e.g., {trainable[:3]})")
+    if len(trainable) == 0:
+        raise RuntimeError("No trainable parameters found! ARW conversion or freeze logic failed.")
 
     # Prepare data
     print("Preparing Domain 0 (English) eval set ...")
