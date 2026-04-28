@@ -1,8 +1,21 @@
+import sys
 import argparse, os, time, math
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 from datasets import load_dataset
+
+# Redirect standard output and error to a log file, keeping a display function for console
+original_stdout = sys.stdout
+log_file = open("training.log", "w", encoding="utf-8")
+sys.stdout = log_file
+sys.stderr = log_file
+
+def display(msg=""):
+    original_stdout.write(str(msg) + "\n")
+    original_stdout.flush()
+    log_file.write(str(msg) + "\n")
+    log_file.flush()
 
 # Optimise for RTX 50-series (Ada/Blackwell): use TF32 for matmuls
 torch.set_float32_matmul_precision('high')
@@ -132,10 +145,10 @@ def evaluate_ppl(model, dataloader, device, tag=''):
         total_loss += loss.item() * mask.sum().item()
         total_tokens += mask.sum().item()
         if i == 0:
-            print(f"  {tag} first batch loss: {loss.item():.4f}")
+            display(f"  {tag} first batch loss: {loss.item():.4f}")
     avg = total_loss / total_tokens if total_tokens > 0 else float('nan')
     ppl = math.exp(avg) if avg < 100 else float('inf')
-    print(f"  {tag} avg loss: {avg:.4f}, PPL: {ppl:.3f}")
+    display(f"  {tag} avg loss: {avg:.4f}, PPL: {ppl:.3f}")
     return ppl
 
 # ---------- Training ----------
@@ -154,7 +167,7 @@ def train(model, loader, opt, epochs, device):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             total += loss.item()
-        print(f"Epoch {epoch+1}/{epochs} Loss: {total/len(loader):.4f} Time: {time.time()-start:.1f}s")
+        display(f"Epoch {epoch+1}/{epochs} Loss: {total/len(loader):.4f} Time: {time.time()-start:.1f}s")
 
 # ---------- Main ----------
 def main():
@@ -187,19 +200,19 @@ def main():
             m.B.requires_grad = True
             arw_cnt += 1
     trainable = [n for n,p in model.named_parameters() if p.requires_grad]
-    print(f"ARW layers: {arw_cnt}, trainable params: {len(trainable)}")
+    display(f"ARW layers: {arw_cnt}, trainable params: {len(trainable)}")
     
     # Use PyTorch 2.0 compiler for faster execution on modern GPUs.
     # We compile the model post-conversion.
-    print("Compiling model (may take a minute) ...")
+    display("Compiling model (may take a minute) ...")
     model = torch.compile(model, mode="max-autotune")
 
     # ===== SANITY CHECK =====
-    print("\n--- Sanity check: dummy input ---")
+    display("\n--- Sanity check: dummy input ---")
     dummy = torch.randint(0, 1000, (1, 10)).to(device)
     with torch.no_grad():
         logits = model(dummy).logits
-        print(f"  logits shape: {logits.shape}, NaN: {torch.isnan(logits).any().item()}, Inf: {torch.isinf(logits).any().item()}")
+        display(f"  logits shape: {logits.shape}, NaN: {torch.isnan(logits).any().item()}, Inf: {torch.isinf(logits).any().item()}")
     if torch.isnan(logits).any() or torch.isinf(logits).any():
         raise RuntimeError("Model produces NaN/Inf before training – aborting.")
 
@@ -209,22 +222,22 @@ def main():
     py_train = prepare_python(tok, num_samples=args.domain1_samples)
     py_loader = DataLoader(py_train, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=2)
 
-    print("\n[ARW] English PPL before training:")
+    display("\n[ARW] English PPL before training:")
     en_before = evaluate_ppl(model, en_loader, device, tag='Before')
 
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    print("\nTraining ARW on Python...")
+    display("\nTraining ARW on Python...")
     train(model, py_loader, opt, args.epochs, device)
 
-    print("\n=== ARW Results ===")
+    display("\n=== ARW Results ===")
     en_after = evaluate_ppl(model, en_loader, device, tag='After ')
     py_after = evaluate_ppl(model, py_loader, device, tag='Python')
     delta = en_after - en_before
-    print(f"English Δ = {delta:+.3f}")
+    display(f"English Δ = {delta:+.3f}")
 
     # Baseline
     if args.run_baseline:
-        print("\n--- Full FT baseline ---")
+        display("\n--- Full FT baseline ---")
         model_ft = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
         model_ft = torch.compile(model_ft, mode="max-autotune")
         
@@ -232,7 +245,7 @@ def main():
         opt_ft = torch.optim.AdamW(model_ft.parameters(), lr=args.lr)
         train(model_ft, py_loader, opt_ft, args.epochs, device)
         en_after_ft = evaluate_ppl(model_ft, en_loader, device, tag='FT After ')
-        print(f"Full FT English Δ = {en_after_ft - en_before_ft:+.3f}")
+        display(f"Full FT English Δ = {en_after_ft - en_before_ft:+.3f}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, 'arw_model.pt'))
