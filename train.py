@@ -40,37 +40,33 @@ class ARWLinear(nn.Module):
     - U_core, V_core: top‑k singular vectors of W0.
     - B (d_out, r), A (r, d_in): learnable low‑rank adapter.
     """
-    def __init__(self, linear: nn.Linear, core_rank: int, adapter_rank: int, device='cuda'):
+    def __init__(self, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
         super().__init__()
-        self.in_features = linear.in_features
-        self.out_features = linear.out_features
+        self.in_features = in_features
+        self.out_features = out_features
         self.core_rank = core_rank
         self.adapter_rank = adapter_rank
 
         # SVD of the pre‑trained weight
-        W = linear.weight.data.to(device).float()   # (out, in)
-        # Center? GPT‑2 linear layers have no bias after QKV projections in attention,
-        # but MLP layers do have bias. We keep bias frozen.
-        U, S, Vh = torch.linalg.svd(W, full_matrices=False)  # U:(out, min(out,in)), Vh:(min(out,in), in)
-
+        W = W.to(device).float()   # (out, in)
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         k = min(core_rank, U.shape[1])
-        self.register_buffer('U_core', U[:, :k].clone())         # (out, k)
-        self.register_buffer('V_core', Vh[:k, :].T.clone())      # (in,  k)  – column of V → V_core = V[:,:k]
-
-        # Original weight frozen
+        self.register_buffer('U_core', U[:, :k].clone())
+        self.register_buffer('V_core', Vh[:k, :].T.clone())   # (in, k)
         self.register_buffer('W0', W.clone())
-
-        # Bias frozen (if exists)
-        if linear.bias is not None:
-            self.register_buffer('bias', linear.bias.data.to(device).float().clone())
+        if bias is not None:
+            self.register_buffer('bias', bias.to(device).float().clone())
         else:
             self.bias = None
 
-        # Learnable low‑rank adapter
-        # Zero‑initialised adapter (so forward pass = original model at start)
+        # Learnable adapter – must start at ZERO
         self.B = nn.Parameter(torch.zeros(self.out_features, adapter_rank, device=device))
         self.A = nn.Parameter(torch.zeros(adapter_rank, self.in_features, device=device))
-        # No random init – must be zero to keep core unchanged initially
+
+    @classmethod
+    def from_weights(cls, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
+        """Alternative constructor for pre‑extracted weight/bias (e.g. from Conv1D)."""
+        return cls(W, bias, in_features, out_features, core_rank, adapter_rank, device)
 
     def _shell_projection(self, dW: torch.Tensor) -> torch.Tensor:
         """Project ΔW into the orthogonal complement of the core subspace."""
@@ -92,14 +88,32 @@ class ARWLinear(nn.Module):
 
     @classmethod
     def convert_gpt2_layers(cls, model, core_rank, adapter_rank, device='cuda'):
-        """Recursively replace nn.Linear layers inside GPT‑2 with ARWLinear."""
+        """Recursively replace nn.Linear and Conv1D layers with ARWLinear."""
         for name, module in model.named_children():
+            # Skip lm_head (tied to embeddings)
+            if 'lm_head' in name:
+                continue
+
+            # Detect either nn.Linear or the classic GPT-2 Conv1D
             if isinstance(module, nn.Linear):
-                # Ignore lm_head? Usually tied with token embeddings; we leave it frozen.
-                if 'lm_head' in name:
-                    continue
-                arw_linear = cls(module, core_rank, adapter_rank, device)
-                setattr(model, name, arw_linear)
+                W = module.weight.data.clone()
+                bias = module.bias.data.clone() if module.bias is not None else None
+                arw = cls.from_weights(W, bias,
+                                       module.in_features,
+                                       module.out_features,
+                                       core_rank, adapter_rank, device)
+                setattr(model, name, arw)
+
+            elif module.__class__.__name__ == 'Conv1D':
+                # Conv1D stores weight as (in_features, out_features) → transpose
+                W = module.weight.data.clone().t()  # now (out, in)
+                bias = module.bias.data.clone() if module.bias is not None else None
+                arw = cls.from_weights(W, bias,
+                                       module.in_features,
+                                       module.out_features,
+                                       core_rank, adapter_rank, device)
+                setattr(model, name, arw)
+
             else:
                 cls.convert_gpt2_layers(module, core_rank, adapter_rank, device)
 
@@ -219,21 +233,21 @@ def main():
     print(f"Converting to ARW (core_rank={args.core_rank}, adapter_rank={args.adapter_rank}) ...")
     ARWLinear.convert_gpt2_layers(model, args.core_rank, args.adapter_rank, device)
 
-    # Freeze all parameters
+    # Freeze everything
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze only ARW adapters
+    arw_modules = 0
     for module in model.modules():
         if isinstance(module, ARWLinear):
             module.A.requires_grad = True
             module.B.requires_grad = True
+            arw_modules += 1
 
-    # Sanity check: verify we have trainable parameters
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
-    print(f"Found {len(trainable)} trainable parameters (e.g., {trainable[:3]})")
-    if len(trainable) == 0:
-        raise RuntimeError("No trainable parameters found! ARW conversion or freeze logic failed.")
+    print(f"ARWLinear modules: {arw_modules}, trainable parameters: {len(trainable)}")
+    if not trainable:
+        raise RuntimeError("No trainable adapters found.")
 
     # Prepare data
     print("Preparing Domain 0 (English) eval set ...")
