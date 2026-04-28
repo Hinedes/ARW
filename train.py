@@ -1,5 +1,6 @@
 import sys
 import argparse, os, time, math
+import gc
 
 # Suppress PyTorch Inductor autotuning spam (Layout conflicts, C++ OOM retries)
 os.environ["TORCH_LOGS"] = "-inductor"
@@ -265,9 +266,16 @@ def main():
     delta = en_after - en_before
     display(f"English Δ = {delta:+.3f}")
 
-    # Baseline
+    os.makedirs(args.output_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(args.output_dir, 'arw_model.pt'))
+
+    # Free memory before running the baseline to prevent OOM
     if args.run_baseline:
         display("\n--- Full FT baseline ---")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
         model_ft = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
         model_ft = torch.compile(model_ft, mode="max-autotune")
         
@@ -276,9 +284,12 @@ def main():
         train(model_ft, py_loader, opt_ft, args.epochs, device)
         en_after_ft = evaluate_ppl(model_ft, en_loader, device, tag='FT After ')
         display(f"Full FT English Δ = {en_after_ft - en_before_ft:+.3f}")
+        del model_ft
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.output_dir, 'arw_model.pt'))
+    # Final cleanup
+    display("\nCleaning up VRAM...")
+    gc.collect()
+    torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     main()
