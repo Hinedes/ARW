@@ -239,7 +239,7 @@ def main():
         raise RuntimeError("Model produces NaN/Inf before training – aborting.")
 
     # Data
-    en_eval = prepare_fixed_eval(tok, device)
+    en_eval = prepare_wikitext_eval(tok, block_size=256, num_samples=1000)  
     en_loader = DataLoader(en_eval, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=0)
     py_train = prepare_python(tok, num_samples=args.domain1_samples)
     py_loader = DataLoader(py_train, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=2)
