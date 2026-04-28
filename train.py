@@ -205,6 +205,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', default='gpt2')
     parser.add_argument('--target_variance', type=float, default=0.99) # 99% variance explained
+    parser.add_argument('--core_rank', type=int, help='Deprecated: use target_variance instead.', default=64)
     parser.add_argument('--adapter_rank', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=3)
