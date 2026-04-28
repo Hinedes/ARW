@@ -1,45 +1,11 @@
-"""
-train_arw.py — Asymmetric Read/Write (ARW) proof-of-concept
-Domain 0: English (WikiText-2)
-Domain 1: Python (CodeParrot subset / custom Python corpus)
-Full fine‑tune baseline included.
-Hardware target: RTX 5070 Ti (16 GB VRAM), 128 GB RAM, single GPU.
-
-ARW mechanism (one‑way glass per linear layer):
-  1. SVD the pre‑trained weight W ∈ ℝ^{d_out × d_in}.
-  2. Keep the top‑k singular vectors as the CORE subspace (Domain 0).
-  3. Adapter ΔW = B @ A (rank r) is forced into the orthogonal SHELL.
-     Projector: P_shell(ΔW) = ΔW – U_core U_core^T ΔW – ΔW V_core V_core^T
-                              + U_core U_core^T ΔW V_core V_core^T
-  4. Forward: y = (W_frozen + P_shell(ΔW)) x   → reads both subspaces.
-  5. Backward: gradients flow only through B, A (and the projectors);
-      W_frozen, U_core, V_core are excluded from autograd.
-Result: Domain 0 input is (by construction) in span(V_core) → A x = 0 → ΔW x = 0
-       → zero contribution from shell → zero forgetting (retention delta +0.000).
-"""
-
-import argparse
-import copy
-import os
-import time
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import argparse, os, time, math
+import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 from datasets import load_dataset
-import math
 
-# ---------------------------------------------------------------------------
-# ARW Linear Layer
-# ---------------------------------------------------------------------------
+# ---------- ARWLinear (zero‑init, from weights) ----------
 class ARWLinear(nn.Module):
-    """
-    Replaces a nn.Linear in GPT‑2.
-    - W0_frozen: the original weight, never gets gradient updates.
-    - U_core, V_core: top‑k singular vectors of W0.
-    - B (d_out, r), A (r, d_in): learnable low‑rank adapter.
-    """
     def __init__(self, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
         super().__init__()
         self.in_features = in_features
@@ -47,263 +13,190 @@ class ARWLinear(nn.Module):
         self.core_rank = core_rank
         self.adapter_rank = adapter_rank
 
-        # SVD of the pre‑trained weight
-        W = W.to(device).float()   # (out, in)
+        W = W.to(device).float()
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         k = min(core_rank, U.shape[1])
-        self.register_buffer('U_core', U[:, :k].clone())
-        self.register_buffer('V_core', Vh[:k, :].T.clone())   # (in, k)
+        self.register_buffer('U_core', U[:, :k].clone())          # (out, k)
+        self.register_buffer('V_core', Vh[:k, :].T.clone())       # (in, k)
         self.register_buffer('W0', W.clone())
-        if bias is not None:
-            self.register_buffer('bias', bias.to(device).float().clone())
-        else:
-            self.bias = None
+        self.bias = bias.to(device).float().clone() if bias is not None else None
 
-        # Learnable adapter – must start at ZERO
-        self.B = nn.Parameter(torch.zeros(self.out_features, adapter_rank, device=device))
-        self.A = nn.Parameter(torch.zeros(adapter_rank, self.in_features, device=device))
+        # Adapter – MUST start at zero
+        self.B = nn.Parameter(torch.zeros(out_features, adapter_rank, device=device))
+        self.A = nn.Parameter(torch.zeros(adapter_rank, in_features, device=device))
+
+    def _shell_projection(self, dW):
+        Uc, Vc = self.U_core, self.V_core
+        term1 = Uc @ (Uc.T @ dW)
+        term2 = (dW @ Vc) @ Vc.T
+        term3 = Uc @ (Uc.T @ dW @ Vc) @ Vc.T
+        return dW - term1 - term2 + term3
+
+    def forward(self, x):
+        dW = self.B @ self.A
+        dW_shell = self._shell_projection(dW)
+        W_eff = self.W0 + dW_shell
+        return F.linear(x, W_eff, self.bias)
 
     @classmethod
     def from_weights(cls, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
-        """Alternative constructor for pre‑extracted weight/bias (e.g. from Conv1D)."""
         return cls(W, bias, in_features, out_features, core_rank, adapter_rank, device)
-
-    def _shell_projection(self, dW: torch.Tensor) -> torch.Tensor:
-        """Project ΔW into the orthogonal complement of the core subspace."""
-        # dW: (out, in)
-        Uc, Vc = self.U_core, self.V_core
-        # Efficient: proj_core(dW) = Uc (Uc^T dW Vc) Vc^T
-        # shell = dW - Uc(Uc^T dW) - (dW Vc)Vc^T + Uc(Uc^T dW Vc)Vc^T
-        term1 = Uc @ (Uc.T @ dW)               # projection onto left core
-        term2 = (dW @ Vc) @ Vc.T               # projection onto right core
-        term3 = Uc @ (Uc.T @ dW @ Vc) @ Vc.T   # overlap term
-        return dW - term1 - term2 + term3
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # ΔW = B @ A
-        dW = self.B @ self.A   # (out, in)
-        dW_shell = self._shell_projection(dW)
-        W_effective = self.W0 + dW_shell
-        return F.linear(x, W_effective, self.bias)
 
     @classmethod
     def convert_gpt2_layers(cls, model, core_rank, adapter_rank, device='cuda'):
-        """Replace nn.Linear and Conv1D layers with ARWLinear."""
         for name, module in model.named_children():
-            if 'lm_head' in name:          # skip lm_head (tied to embeddings)
+            if 'lm_head' in name:
                 continue
-
-            if hasattr(module, 'in_features') and module.__class__.__name__ != 'Conv1D':
-                # Standard nn.Linear
+            if isinstance(module, nn.Linear):
                 W = module.weight.data.clone()
                 bias = module.bias.data.clone() if module.bias is not None else None
-                in_feat = module.in_features
-                out_feat = module.out_features
-
+                in_feat, out_feat = module.in_features, module.out_features
             elif module.__class__.__name__ == 'Conv1D':
-                # GPT‑2 custom Conv1D: weight is (nx, nf) → transpose to (out, in)
+                # Conv1D weight: (in, out) → transpose to (out, in)
                 W = module.weight.data.clone().t().contiguous()
                 bias = module.bias.data.clone() if module.bias is not None else None
-                in_feat = module.nx          # input features
-                out_feat = module.nf         # output features
-
+                in_feat, out_feat = module.nx, module.nf
             else:
-                # Recurse into child modules (e.g., GPT2Attention, GPT2MLP)
                 cls.convert_gpt2_layers(module, core_rank, adapter_rank, device)
                 continue
-
-            arw = ARWLinear.from_weights(W, bias, in_feat, out_feat,
-                                         core_rank, adapter_rank, device)
+            arw = ARWLinear.from_weights(W, bias, in_feat, out_feat, core_rank, adapter_rank, device)
             setattr(model, name, arw)
 
-# ---------------------------------------------------------------------------
-# Dataset helpers
-# ---------------------------------------------------------------------------
+# ---------- Datasets ----------
 class TextDataset(Dataset):
     def __init__(self, encodings):
         self.input_ids = encodings['input_ids']
         self.attention_mask = encodings['attention_mask']
-
     def __getitem__(self, idx):
-        return {
-            'input_ids': self.input_ids[idx],
-            'attention_mask': self.attention_mask[idx]
-        }
-
+        return {'input_ids': self.input_ids[idx], 'attention_mask': self.attention_mask[idx]}
     def __len__(self):
         return len(self.input_ids)
 
 def prepare_wikitext(tokenizer, block_size=256, num_samples=5000):
-    """WikiText‑2 (English) as Domain 0."""
     dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    texts = [x['text'] for x in dataset if len(x['text']) > 10]
-    # Take a subset to speed up eval
-    texts = texts[:num_samples*2]
+    texts = [x['text'] for x in dataset if len(x['text']) > 10][:num_samples*2]
     enc = tokenizer(texts, return_tensors='pt', truncation=True, padding=True, max_length=block_size)
     return TextDataset(enc)
 
 def prepare_python(tokenizer, block_size=256, num_samples=5000):
-    """Python code from CodeSearchNet or custom .py files. Uses codeparrot/github-code dummy."""
-    # For a real experiment: point to a local Python corpus.
-    # Here we use a small huggingface dataset as placeholder.
     try:
         dataset = load_dataset('codeparrot/github-code', 'python', split='train', streaming=True)
         samples = []
-        for i, example in enumerate(dataset):
-            if i >= num_samples * 2:
-                break
-            samples.append(example['code'][:1000])
+        for i, ex in enumerate(dataset):
+            if i >= num_samples*2: break
+            samples.append(ex['code'][:1000])
         enc = tokenizer(samples, return_tensors='pt', truncation=True, padding=True, max_length=block_size)
         return TextDataset(enc)
-    except Exception:
-        # Fallback: synthetic Python strings
-        py_texts = ["def foo():\n    return 42\n"] * (num_samples * 2)
-        enc = tokenizer(py_texts, return_tensors='pt', truncation=True, padding=True, max_length=block_size)
+    except:
+        py = ["def foo():\n    return 42\n"] * (num_samples*2)
+        enc = tokenizer(py, return_tensors='pt', truncation=True, padding=True, max_length=block_size)
         return TextDataset(enc)
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
+# ---------- Eval with debug ----------
 @torch.no_grad()
-def evaluate_ppl(model, dataloader, device):
+def evaluate_ppl(model, dataloader, device, tag=''):
     model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    for batch in dataloader:
+    total_loss, total_tokens = 0.0, 0
+    for i, batch in enumerate(dataloader):
         input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        outputs = model(input_ids, attention_mask=attention_mask, labels=input_ids)
-        # shift logits & labels internally handled by GPT2
-        loss = outputs.loss
-        total_loss += loss.item() * input_ids.numel()
-        total_tokens += attention_mask.sum().item()
-    avg_loss = total_loss / total_tokens
-    perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
-    return perplexity
+        mask = batch['attention_mask'].to(device)
+        out = model(input_ids, attention_mask=mask, labels=input_ids)
+        loss = out.loss
+        total_loss += loss.item() * mask.sum().item()
+        total_tokens += mask.sum().item()
+        if i == 0:
+            print(f"  {tag} first batch loss: {loss.item():.4f}")
+    avg = total_loss / total_tokens if total_tokens > 0 else float('nan')
+    ppl = math.exp(avg) if avg < 100 else float('inf')
+    print(f"  {tag} avg loss: {avg:.4f}, PPL: {ppl:.3f}")
+    return ppl
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-def train(model, train_loader, optimizer, epochs, device, arw_mode=True):
-    model.train()
+# ---------- Training ----------
+def train(model, loader, opt, epochs, device):
     for epoch in range(epochs):
-        start = time.time()
-        total_loss = 0.0
-        for batch in train_loader:
+        start = time.time(); total = 0.0
+        for batch in loader:
             input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            optimizer.zero_grad()
-            outputs = model(input_ids, attention_mask=attention_mask, labels=input_ids)
-            loss = outputs.loss
+            mask = batch['attention_mask'].to(device)
+            opt.zero_grad()
+            loss = model(input_ids, attention_mask=mask, labels=input_ids).loss
             loss.backward()
-            # Optional: gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}  Loss: {avg_loss:.4f}  Time: {time.time()-start:.1f}s")
+            opt.step()
+            total += loss.item()
+        print(f"Epoch {epoch+1}/{epochs} Loss: {total/len(loader):.4f} Time: {time.time()-start:.1f}s")
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='gpt2')
-    parser.add_argument('--core_rank', type=int, default=64, help='Top‑k singular values kept as core')
-    parser.add_argument('--adapter_rank', type=int, default=32, help='Rank of the learned shell adapter')
+    parser.add_argument('--model_name', default='gpt2')
+    parser.add_argument('--core_rank', type=int, default=8)   # small core = large shell
+    parser.add_argument('--adapter_rank', type=int, default=32)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=3)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)    # higher lr for small adapter
     parser.add_argument('--domain1_samples', type=int, default=2000)
-    parser.add_argument('--run_baseline', action='store_true', help='Also run full fine‑tune baseline')
-    parser.add_argument('--output_dir', type=str, default='./arw_results')
+    parser.add_argument('--run_baseline', action='store_true')
+    parser.add_argument('--output_dir', default='./arw_results')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tokenizer = GPT2TokenizerFast.from_pretrained(args.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    tok = GPT2TokenizerFast.from_pretrained(args.model_name); tok.pad_token = tok.eos_token
 
-    # --- Load model ---
-    print("Loading pre‑trained GPT‑2 ...")
-    model = GPT2LMHeadModel.from_pretrained(args.model_name)
-    model.to(device)
-
-    # --- ARW conversion ---
-    print(f"Converting to ARW (core_rank={args.core_rank}, adapter_rank={args.adapter_rank}) ...")
+    model = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
     ARWLinear.convert_gpt2_layers(model, args.core_rank, args.adapter_rank, device)
 
-    # Freeze everything
-    for param in model.parameters():
-        param.requires_grad = False
+    # Freeze all except adapter
+    for p in model.parameters(): p.requires_grad = False
+    arw_cnt = 0
+    for m in model.modules():
+        if isinstance(m, ARWLinear):
+            m.A.requires_grad = True
+            m.B.requires_grad = True
+            arw_cnt += 1
+    trainable = [n for n,p in model.named_parameters() if p.requires_grad]
+    print(f"ARW layers: {arw_cnt}, trainable params: {len(trainable)}")
 
-    arw_modules = 0
-    for module in model.modules():
-        if isinstance(module, ARWLinear):
-            module.A.requires_grad = True
-            module.B.requires_grad = True
-            arw_modules += 1
+    # ===== SANITY CHECK =====
+    print("\n--- Sanity check: dummy input ---")
+    dummy = torch.randint(0, 1000, (1, 10)).to(device)
+    with torch.no_grad():
+        logits = model(dummy).logits
+        print(f"  logits shape: {logits.shape}, NaN: {torch.isnan(logits).any().item()}, Inf: {torch.isinf(logits).any().item()}")
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        raise RuntimeError("Model produces NaN/Inf before training – aborting.")
 
-    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
-    print(f"ARWLinear modules: {arw_modules}, trainable parameters: {len(trainable)}")
-    if not trainable:
-        raise RuntimeError("No trainable adapters found.")
+    # Data
+    en_eval = prepare_wikitext(tok, num_samples=500)
+    en_loader = DataLoader(en_eval, batch_size=args.batch_size, shuffle=False)
+    py_train = prepare_python(tok, num_samples=args.domain1_samples)
+    py_loader = DataLoader(py_train, batch_size=args.batch_size, shuffle=True)
 
-    # Prepare data
-    print("Preparing Domain 0 (English) eval set ...")
-    eval_en = prepare_wikitext(tokenizer, num_samples=500)
-    eval_en_loader = DataLoader(eval_en, batch_size=args.batch_size, shuffle=False)
+    print("\n[ARW] English PPL before training:")
+    en_before = evaluate_ppl(model, en_loader, device, tag='Before')
 
-    print("Preparing Domain 1 (Python) train set ...")
-    train_py = prepare_python(tokenizer, num_samples=args.domain1_samples)
-    train_py_loader = DataLoader(train_py, batch_size=args.batch_size, shuffle=True)
-
-    # --- Baseline perplexity before any training ---
-    ppl_en_before = evaluate_ppl(model, eval_en_loader, device)
-    print(f"\n[ARW] English PPL before training: {ppl_en_before:.3f}")
-
-    # --- Train ARW on Python ---
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    print("Training ARW on Domain 1 (Python) ...")
-    train(model, train_py_loader, opt, args.epochs, device, arw_mode=True)
+    print("\nTraining ARW on Python...")
+    train(model, py_loader, opt, args.epochs, device)
 
-    # --- Evaluate after training ---
-    ppl_en_after = evaluate_ppl(model, eval_en_loader, device)
-    ppl_py_after = evaluate_ppl(model, train_py_loader, device)  # on train set (proxy)
-    delta = ppl_en_after - ppl_en_before
-    print(f"\n=== ARW Results ===")
-    print(f"English PPL after Python training: {ppl_en_after:.3f}  (Δ = {delta:+.3f})")
-    print(f"Python PPL (train set): {ppl_py_after:.3f}")
+    print("\n=== ARW Results ===")
+    en_after = evaluate_ppl(model, en_loader, device, tag='After ')
+    py_after = evaluate_ppl(model, py_loader, device, tag='Python')
+    delta = en_after - en_before
+    print(f"English Δ = {delta:+.3f}")
 
-    # --- Baseline: Full fine‑tune (if requested) ---
+    # Baseline
     if args.run_baseline:
-        print("\n--- Running full fine‑tune baseline ---")
-        model_ft = GPT2LMHeadModel.from_pretrained(args.model_name)
-        model_ft.to(device)
-        ppl_en_before_ft = evaluate_ppl(model_ft, eval_en_loader, device)
+        print("\n--- Full FT baseline ---")
+        model_ft = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
+        en_before_ft = evaluate_ppl(model_ft, en_loader, device, tag='FT Before')
         opt_ft = torch.optim.AdamW(model_ft.parameters(), lr=args.lr)
-        print("Full FT on Python ...")
-        train(model_ft, train_py_loader, opt_ft, args.epochs, device, arw_mode=False)
-        ppl_en_after_ft = evaluate_ppl(model_ft, eval_en_loader, device)
-        ppl_py_after_ft = evaluate_ppl(model_ft, train_py_loader, device)
-        delta_ft = ppl_en_after_ft - ppl_en_before_ft
-        print(f"=== Full FT Baseline ===")
-        print(f"English PPL after Python: {ppl_en_after_ft:.3f}  (Δ = {delta_ft:+.3f})")
-        print(f"Python PPL (train set): {ppl_py_after_ft:.3f}")
+        train(model_ft, py_loader, opt_ft, args.epochs, device)
+        en_after_ft = evaluate_ppl(model_ft, en_loader, device, tag='FT After ')
+        print(f"Full FT English Δ = {en_after_ft - en_before_ft:+.3f}")
 
-    # Save model
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, 'arw_model.pt'))
-    print(f"Model saved to {args.output_dir}")
-
-    # --- Optional jailbreak test design ---
-    print("\nJailbreak test design:")
-    print(" To verify immutability of Domain 0 under adversarial fine‑tuning:")
-    print(" 1. Keep Domain 0 core + Domain 1 shell frozen.")
-    print(" 2. Add a SECOND shell (ARW‑2) with fresh A,B initialized and projected orthogonal to core (and optionally to shell 1).")
-    print(" 3. Train ARW‑2 on harmful/toxic text (e.g., RealToxicityPrompts).")
-    print(" 4. Confirm that Domain 0 outputs remain safe and coherent (PPL unchanged, Toxicity score low).")
-    print(" Because ΔW_harmful lives in a shell orthogonal to the core, it cannot alter core behaviour.")
-    print(" Implementation: import a toxic dataset, freeze existing adapters, add new ARWLinear for Domain 2 using a distinct set of A,B (rank r2), and repeat training.")
 
 if __name__ == '__main__':
     main()
