@@ -21,9 +21,10 @@ class ARWLinear(nn.Module):
         self.register_buffer('W0', W.clone())
         self.bias = bias.to(device).float().clone() if bias is not None else None
 
-        # Adapter – MUST start at zero
+        # Adapter – A random init, B zeroed so ΔW = B@A = 0 at start
+        self.A = nn.Parameter(torch.empty(adapter_rank, self.in_features, device=device))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
         self.B = nn.Parameter(torch.zeros(out_features, adapter_rank, device=device))
-        self.A = nn.Parameter(torch.zeros(adapter_rank, in_features, device=device))
 
     def _shell_projection(self, dW):
         Uc, Vc = self.U_core, self.V_core
