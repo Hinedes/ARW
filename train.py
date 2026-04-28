@@ -32,6 +32,37 @@ def display(msg=""):
 torch.set_float32_matmul_precision('high')
 
 # ---------- ARWLinear (zero‑init, from weights) ----------
+class ARWLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W0, bias, U_core, V_core, A, B):
+        dW = B @ A
+        W_eff = W0 + dW
+        ctx.save_for_backward(x, W0, bias, U_core, V_core, A, B, dW)
+        return F.linear(x, W_eff, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, W0, bias, U_core, V_core, A, B, dW = ctx.saved_tensors
+        # Gradient w.r.t. effective weight
+        grad_W_eff = grad_output.reshape(-1, grad_output.size(-1)).t() @ x.reshape(x.size(0), -1)
+        # Project onto shell complement
+        Uc, Vc = U_core, V_core  # ensure (out, k), (in, k) -- wait, in init we still define U_core and V_core. Check shape. Yes, see below! U_core is (out, k), V_core is (in, k). Let's use them directly without transposing, or if the user code had .t(), let's double check!
+        # According to the user patch: `Uc, Vc = U_core.t(), V_core.t()  # ensure (out, k), (in, k)` Wait, U_core in init was (out, k). Let's use the code from the user exact patch:
+        Uc, Vc = U_core, V_core
+        term1 = Uc @ (Uc.t() @ grad_W_eff)
+        term2 = (grad_W_eff @ Vc) @ Vc.t()
+        term3 = Uc @ (Uc.t() @ grad_W_eff @ Vc) @ Vc.t()
+        grad_W_shell = grad_W_eff - term1 - term2 + term3
+        # grad_input = grad_output @ W_eff^T
+        W_eff = W0 + dW
+        grad_input = grad_output @ W_eff.t()
+        grad_bias = grad_output.sum(dim=(0,1)) if grad_output.dim()==3 else grad_output.sum(dim=0)
+        # Gradients for A and B
+        grad_B = grad_W_shell @ A.t()
+        grad_A = B.t() @ grad_W_shell
+        return grad_input, None, grad_bias, None, None, grad_A, grad_B
+
+
 class ARWLinear(nn.Module):
     def __init__(self, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
         super().__init__()
@@ -43,28 +74,17 @@ class ARWLinear(nn.Module):
         W = W.to(device).float()
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         k = min(core_rank, U.shape[1])
-        self.register_buffer('U_core', U[:, :k].clone())          # (out, k)
-        self.register_buffer('V_core', Vh[:k, :].T.clone())       # (in, k)
+        self.register_buffer('U_core', U[:, :k].clone())
+        self.register_buffer('V_core', Vh[:k, :].T.clone())
         self.register_buffer('W0', W.clone())
         self.bias = bias.to(device).float().clone() if bias is not None else None
 
-        # Adapter – A random init, B zeroed so ΔW = B@A = 0 at start
         self.A = nn.Parameter(torch.empty(adapter_rank, self.in_features, device=device))
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
         self.B = nn.Parameter(torch.zeros(out_features, adapter_rank, device=device))
 
-    def _shell_projection(self, dW):
-        Uc, Vc = self.U_core, self.V_core
-        term1 = Uc @ (Uc.T @ dW)
-        term2 = (dW @ Vc) @ Vc.T
-        term3 = Uc @ (Uc.T @ dW @ Vc) @ Vc.T
-        return dW - term1 - term2 + term3
-
     def forward(self, x):
-        dW = self.B @ self.A
-        dW_shell = self._shell_projection(dW)
-        W_eff = self.W0 + dW_shell
-        return F.linear(x, W_eff, self.bias)
+        return ARWLinearFunction.apply(x, self.W0, self.bias, self.U_core, self.V_core, self.A, self.B)
 
     @classmethod
     def from_weights(cls, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
@@ -180,7 +200,9 @@ def train(model, loader, opt, epochs, device):
             
             try:
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    loss = model(input_ids, attention_mask=mask, labels=input_ids).loss
+                labels = input_ids.clone()
+                labels[mask == 0] = -100
+                loss = model(input_ids, attention_mask=mask, labels=labels).loss
                     
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -197,7 +219,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', default='gpt2')
     parser.add_argument('--target_variance', type=float, default=0.99) # 99% variance explained
-    parser.add_argument('--core_rank', type=int, help='Deprecated: use target_variance instead.', default=64)
     parser.add_argument('--adapter_rank', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=3)
