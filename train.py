@@ -59,8 +59,17 @@ class ARWLinear(nn.Module):
     def from_weights(cls, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
         return cls(W, bias, in_features, out_features, core_rank, adapter_rank, device)
 
+    @staticmethod
+    def required_rank_for_variance(W, target_variance=0.99):
+        """Return smallest k such that top-k singular vectors explain >= target_variance."""
+        U, S, Vh = torch.linalg.svd(W.float(), full_matrices=False)
+        total_var = (S ** 2).sum()
+        cum_var = torch.cumsum(S ** 2, dim=0)
+        k = torch.searchsorted(cum_var / total_var, torch.tensor(target_variance).to(S.device)) + 1
+        return int(k.clamp(max=len(S)).item())
+
     @classmethod
-    def convert_gpt2_layers(cls, model, core_rank, adapter_rank, device='cuda'):
+    def convert_gpt2_layers_adaptive(cls, model, target_variance=0.99, adapter_rank=16, device='cuda'):
         for name, module in model.named_children():
             if 'lm_head' in name:
                 continue
@@ -74,9 +83,10 @@ class ARWLinear(nn.Module):
                 bias = module.bias.data.clone() if module.bias is not None else None
                 in_feat, out_feat = module.nx, module.nf
             else:
-                cls.convert_gpt2_layers(module, core_rank, adapter_rank, device)
+                cls.convert_gpt2_layers_adaptive(module, target_variance, adapter_rank, device)
                 continue
-            arw = ARWLinear.from_weights(W, bias, in_feat, out_feat, core_rank, adapter_rank, device)
+            core_r = cls.required_rank_for_variance(W, target_variance)
+            arw = cls.from_weights(W, bias, in_feat, out_feat, core_r, adapter_rank, device)
             setattr(model, name, arw)
 
 # ---------- Datasets ----------
@@ -173,8 +183,8 @@ def train(model, loader, opt, epochs, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', default='gpt2')
-    parser.add_argument('--core_rank', type=int, default=8)   # small core = large shell
-    parser.add_argument('--adapter_rank', type=int, default=32)
+    parser.add_argument('--target_variance', type=float, default=0.99) # 99% variance explained
+    parser.add_argument('--adapter_rank', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--lr', type=float, default=1e-3)    # higher lr for small adapter
@@ -189,7 +199,7 @@ def main():
     tok = GPT2TokenizerFast.from_pretrained(args.model_name); tok.pad_token = tok.eos_token
 
     model = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
-    ARWLinear.convert_gpt2_layers(model, args.core_rank, args.adapter_rank, device)
+    ARWLinear.convert_gpt2_layers_adaptive(model, args.target_variance, args.adapter_rank, device)
 
     # Freeze all except adapter
     for p in model.parameters(): p.requires_grad = False

@@ -28,7 +28,7 @@ en_loader = DataLoader(en, batch_size=1)
 
 orig = GPT2LMHeadModel.from_pretrained('gpt2').to(device).eval()
 arw = GPT2LMHeadModel.from_pretrained('gpt2').to(device)
-ARWLinear.convert_gpt2_layers(arw, core_rank=8, adapter_rank=32, device=device)
+ARWLinear.convert_gpt2_layers_adaptive(arw, target_variance=0.99, adapter_rank=8, device=device)
 arw.eval()
 
 batch = next(iter(en_loader))

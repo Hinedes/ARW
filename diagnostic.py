@@ -48,8 +48,16 @@ class ARWLinear(nn.Module):
     def from_weights(cls, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
         return cls(W, bias, in_features, out_features, core_rank, adapter_rank, device)
 
+    @staticmethod
+    def required_rank_for_variance(W, target_variance=0.99):
+        U, S, Vh = torch.linalg.svd(W.float(), full_matrices=False)
+        total_var = (S ** 2).sum()
+        cum_var = torch.cumsum(S ** 2, dim=0)
+        k = torch.searchsorted(cum_var / total_var, torch.tensor(target_variance).to(S.device)) + 1
+        return int(k.clamp(max=len(S)).item())
+
     @classmethod
-    def convert_gpt2_layers(cls, model, core_rank, adapter_rank, device='cuda'):
+    def convert_gpt2_layers_adaptive(cls, model, target_variance=0.99, adapter_rank=16, device='cuda'):
         for name, module in model.named_children():
             if 'lm_head' in name:
                 continue
@@ -58,14 +66,14 @@ class ARWLinear(nn.Module):
                 bias = module.bias.data.clone() if module.bias is not None else None
                 in_feat, out_feat = module.in_features, module.out_features
             elif module.__class__.__name__ == 'Conv1D':
-                # Conv1D weight: (in, out) → transpose to (out, in)
                 W = module.weight.data.clone().t().contiguous()
                 bias = module.bias.data.clone() if module.bias is not None else None
                 in_feat, out_feat = module.nx, module.nf
             else:
-                cls.convert_gpt2_layers(module, core_rank, adapter_rank, device)
+                cls.convert_gpt2_layers_adaptive(module, target_variance, adapter_rank, device)
                 continue
-            arw = ARWLinear.from_weights(W, bias, in_feat, out_feat, core_rank, adapter_rank, device)
+            core_r = cls.required_rank_for_variance(W, target_variance)
+            arw = ARWLinear.from_weights(W, bias, in_feat, out_feat, core_r, adapter_rank, device)
             setattr(model, name, arw)
 
 # ---------- Test ----------
@@ -88,7 +96,7 @@ print(f"Original loss: {loss_orig:.6f}")
 # ARW model
 print("Loading GPT-2 and converting to ARW...")
 arw = GPT2LMHeadModel.from_pretrained('gpt2').to(device)
-ARWLinear.convert_gpt2_layers(arw, core_rank=8, adapter_rank=32, device=device)
+ARWLinear.convert_gpt2_layers_adaptive(arw, target_variance=0.99, adapter_rank=8, device=device)
 arw.eval()
 with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
     loss_arw = arw(**inp.to(device), labels=inp['input_ids'].to(device)).loss.item()
