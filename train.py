@@ -4,6 +4,9 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 from datasets import load_dataset
 
+# Optimise for RTX 50-series (Ada/Blackwell): use TF32 for matmuls
+torch.set_float32_matmul_precision('high')
+
 # ---------- ARWLinear (zero‑init, from weights) ----------
 class ARWLinear(nn.Module):
     def __init__(self, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
@@ -99,10 +102,13 @@ def evaluate_ppl(model, dataloader, device, tag=''):
     model.eval()
     total_loss, total_tokens = 0.0, 0
     for i, batch in enumerate(dataloader):
-        input_ids = batch['input_ids'].to(device)
-        mask = batch['attention_mask'].to(device)
-        out = model(input_ids, attention_mask=mask, labels=input_ids)
-        loss = out.loss
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        mask = batch['attention_mask'].to(device, non_blocking=True)
+        
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            out = model(input_ids, attention_mask=mask, labels=input_ids)
+            loss = out.loss
+            
         total_loss += loss.item() * mask.sum().item()
         total_tokens += mask.sum().item()
         if i == 0:
@@ -117,10 +123,13 @@ def train(model, loader, opt, epochs, device):
     for epoch in range(epochs):
         start = time.time(); total = 0.0
         for batch in loader:
-            input_ids = batch['input_ids'].to(device)
-            mask = batch['attention_mask'].to(device)
-            opt.zero_grad()
-            loss = model(input_ids, attention_mask=mask, labels=input_ids).loss
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            mask = batch['attention_mask'].to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                loss = model(input_ids, attention_mask=mask, labels=input_ids).loss
+                
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -141,7 +150,9 @@ def main():
     parser.add_argument('--output_dir', default='./arw_results')
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    assert torch.cuda.is_available(), "This script requires a GPU!"
+    device = torch.device('cuda')
+    
     tok = GPT2TokenizerFast.from_pretrained(args.model_name); tok.pad_token = tok.eos_token
 
     model = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
@@ -157,6 +168,11 @@ def main():
             arw_cnt += 1
     trainable = [n for n,p in model.named_parameters() if p.requires_grad]
     print(f"ARW layers: {arw_cnt}, trainable params: {len(trainable)}")
+    
+    # Use PyTorch 2.0 compiler for faster execution on modern GPUs.
+    # We compile the model post-conversion.
+    print("Compiling model (may take a minute) ...")
+    model = torch.compile(model, mode="max-autotune")
 
     # ===== SANITY CHECK =====
     print("\n--- Sanity check: dummy input ---")
@@ -169,9 +185,9 @@ def main():
 
     # Data
     en_eval = prepare_wikitext(tok, num_samples=500)
-    en_loader = DataLoader(en_eval, batch_size=args.batch_size, shuffle=False)
+    en_loader = DataLoader(en_eval, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=2)
     py_train = prepare_python(tok, num_samples=args.domain1_samples)
-    py_loader = DataLoader(py_train, batch_size=args.batch_size, shuffle=True)
+    py_loader = DataLoader(py_train, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=2)
 
     print("\n[ARW] English PPL before training:")
     en_before = evaluate_ppl(model, en_loader, device, tag='Before')
@@ -190,6 +206,8 @@ def main():
     if args.run_baseline:
         print("\n--- Full FT baseline ---")
         model_ft = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
+        model_ft = torch.compile(model_ft, mode="max-autotune")
+        
         en_before_ft = evaluate_ppl(model_ft, en_loader, device, tag='FT Before')
         opt_ft = torch.optim.AdamW(model_ft.parameters(), lr=args.lr)
         train(model_ft, py_loader, opt_ft, args.epochs, device)

@@ -6,6 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 
+# 5070 Ti optimizations
+torch.set_float32_matmul_precision('high')
+device = torch.device('cuda')
+
 # ---------- ARWLinear (copy from train_arw.py) ----------
 class ARWLinear(nn.Module):
     def __init__(self, W, bias, in_features, out_features, core_rank, adapter_rank, device='cuda'):
@@ -76,18 +80,18 @@ print("\n=== Testing Model Loss ===")
 
 # Original model
 print("Loading original GPT-2...")
-orig = GPT2LMHeadModel.from_pretrained('gpt2').eval()
-with torch.no_grad():
-    loss_orig = orig(**inp, labels=inp['input_ids']).loss.item()
+orig = GPT2LMHeadModel.from_pretrained('gpt2').eval().to(device)
+with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+    loss_orig = orig(**inp.to(device), labels=inp['input_ids'].to(device)).loss.item()
 print(f"Original loss: {loss_orig:.6f}")
 
 # ARW model
 print("Loading GPT-2 and converting to ARW...")
-arw = GPT2LMHeadModel.from_pretrained('gpt2')
-ARWLinear.convert_gpt2_layers(arw, core_rank=8, adapter_rank=32, device='cpu')
+arw = GPT2LMHeadModel.from_pretrained('gpt2').to(device)
+ARWLinear.convert_gpt2_layers(arw, core_rank=8, adapter_rank=32, device=device)
 arw.eval()
-with torch.no_grad():
-    loss_arw = arw(**inp, labels=inp['input_ids']).loss.item()
+with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+    loss_arw = arw(**inp.to(device), labels=inp['input_ids'].to(device)).loss.item()
 print(f"ARW loss:      {loss_arw:.6f}")
 
 loss_diff = abs(loss_orig - loss_arw)
@@ -107,15 +111,16 @@ print(f"  Type: {type(arw_attn)}")
 print(f"  W0 shape: {arw_attn.W0.shape if hasattr(arw_attn, 'W0') else 'N/A'}")
 
 print("Testing single layer with random input...")
-hidden = torch.randn(1, 768)
-with torch.no_grad():
+hidden = torch.randn(1, 768).to(device, dtype=torch.bfloat16)
+
+with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
     out_orig = orig_attn(hidden)
     out_arw = arw_attn(hidden)
 
 print(f"Original output shape: {out_orig.shape}")
 print(f"ARW output shape:      {out_arw.shape}")
 
-layer_diff = (out_orig - out_arw).abs().max().item()
+layer_diff = (out_orig - out_arw).float().abs().max().item()
 print(f"Max layer diff: {layer_diff:.6f}")
 
 print("\n=== Summary ===")
