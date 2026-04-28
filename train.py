@@ -1,6 +1,16 @@
 import sys
 import argparse, os, time, math
+
+# Suppress PyTorch Inductor autotuning spam (Layout conflicts, C++ OOM retries)
+os.environ["TORCH_LOGS"] = "-inductor"
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+import logging
+logging.getLogger("torch._inductor.scheduler").setLevel(logging.CRITICAL)
+logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.CRITICAL)
+logging.getLogger("torch._inductor.utils").setLevel(logging.CRITICAL)
+
 import torch, torch.nn as nn, torch.nn.functional as F
+
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 from datasets import load_dataset
