@@ -11,6 +11,14 @@ When a model is fine-tuned on a new domain, ARW lets it read all prior knowledge
 - [ ] Jailbreak-resistance test
 - [ ] Paper draft
 
+### Related Projects
+
+* **[Proteus][1]** — Matryoshka Subspace Freezing (first implementation of the core-freeze idea).
+* **[Potential Well Project][2]** — Orthogonal subspace partitioning (precursor; identified the Orthogonality Paradox that ARW resolves).
+
+[1]: https://github.com/hinedes/proteus
+[2]: https://github.com/hinedes/potential-well-project
+
 ## Quickstart (coming soon)
 
 ```bash
