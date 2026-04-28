@@ -40,26 +40,36 @@ class ARWLinearFunction(torch.autograd.Function):
         ctx.save_for_backward(x, W0, bias, U_core, V_core, A, B, dW)
         return F.linear(x, W_eff, bias)
 
-    @staticmethod
+        @staticmethod
     def backward(ctx, grad_output):
         x, W0, bias, U_core, V_core, A, B, dW = ctx.saved_tensors
-        # Gradient w.r.t. effective weight
-        grad_W_eff = grad_output.reshape(-1, grad_output.size(-1)).t() @ x.reshape(x.size(0), -1)
+        # Flatten the batch and sequence dimensions
+        batch_size, seq_len, hidden = x.shape
+        x_flat = x.reshape(-1, hidden)                     # (B*S, H)
+        grad_flat = grad_output.reshape(-1, hidden)        # (B*S, H)
+
+        # Gradient w.r.t. effective weight: (H_out, H_in) = (768, 768)
+        grad_W_eff = grad_flat.t() @ x_flat               # (768, 768)
+
         # Project onto shell complement
-        Uc, Vc = U_core, V_core  # ensure (out, k), (in, k) -- wait, in init we still define U_core and V_core. Check shape. Yes, see below! U_core is (out, k), V_core is (in, k). Let's use them directly without transposing, or if the user code had .t(), let's double check!
-        # According to the user patch: `Uc, Vc = U_core.t(), V_core.t()  # ensure (out, k), (in, k)` Wait, U_core in init was (out, k). Let's use the code from the user exact patch:
         Uc, Vc = U_core, V_core
         term1 = Uc @ (Uc.t() @ grad_W_eff)
         term2 = (grad_W_eff @ Vc) @ Vc.t()
         term3 = Uc @ (Uc.t() @ grad_W_eff @ Vc) @ Vc.t()
         grad_W_shell = grad_W_eff - term1 - term2 + term3
-        # grad_input = grad_output @ W_eff^T
+
+        # grad_input = grad_output @ W_eff^T, with proper flattening
         W_eff = W0 + dW
-        grad_input = grad_output @ W_eff.t()
-        grad_bias = grad_output.sum(dim=(0,1)) if grad_output.dim()==3 else grad_output.sum(dim=0)
-        # Gradients for A and B
-        grad_B = grad_W_shell @ A.t()
-        grad_A = B.t() @ grad_W_shell
+        grad_input = grad_flat @ W_eff.t()                # (B*S, H)
+        grad_input = grad_input.view(batch_size, seq_len, hidden)
+
+        # Bias gradient
+        grad_bias = grad_output.sum(dim=(0, 1)) if grad_output.dim() == 3 else grad_output.sum(dim=0)
+
+        # Gradients for adapter weights
+        grad_B = grad_W_shell @ A.t()                     # (768, r)
+        grad_A = B.t() @ grad_W_shell                     # (r, 768)
+
         return grad_input, None, grad_bias, None, None, grad_A, grad_B
 
 
