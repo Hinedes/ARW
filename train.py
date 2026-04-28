@@ -148,14 +148,19 @@ def evaluate_ppl(model, dataloader, device, tag=''):
         input_ids = batch['input_ids'].to(device, non_blocking=True)
         mask = batch['attention_mask'].to(device, non_blocking=True)
         
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            out = model(input_ids, attention_mask=mask, labels=input_ids)
-            loss = out.loss
-            
-        total_loss += loss.item() * mask.sum().item()
-        total_tokens += mask.sum().item()
-        if i == 0:
-            display(f"  {tag} first batch loss: {loss.item():.4f}")
+        try:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                out = model(input_ids, attention_mask=mask, labels=input_ids)
+                loss = out.loss
+                
+            total_loss += loss.item() * mask.sum().item()
+            total_tokens += mask.sum().item()
+            if i == 0:
+                display(f"  {tag} first batch loss: {loss.item():.4f}")
+        except torch.cuda.OutOfMemoryError:
+            display(f"WARNING: CUDA Out of Memory during {tag} eval! Clearing cache...")
+            torch.cuda.empty_cache()
+            break
     avg = total_loss / total_tokens if total_tokens > 0 else float('nan')
     ppl = math.exp(avg) if avg < 100 else float('inf')
     display(f"  {tag} avg loss: {avg:.4f}, PPL: {ppl:.3f}")
@@ -170,13 +175,18 @@ def train(model, loader, opt, epochs, device):
             mask = batch['attention_mask'].to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
             
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                loss = model(input_ids, attention_mask=mask, labels=input_ids).loss
-                
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            total += loss.item()
+            try:
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    loss = model(input_ids, attention_mask=mask, labels=input_ids).loss
+                    
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                total += loss.item()
+            except torch.cuda.OutOfMemoryError:
+                display("WARNING: CUDA Out of Memory during training! Clearing cache and terminating gracefully...")
+                torch.cuda.empty_cache()
+                return  # Gracefully exit the training loop early
         display(f"Epoch {epoch+1}/{epochs} Loss: {total/len(loader):.4f} Time: {time.time()-start:.1f}s")
 
 # ---------- Main ----------
