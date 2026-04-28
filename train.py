@@ -88,34 +88,33 @@ class ARWLinear(nn.Module):
 
     @classmethod
     def convert_gpt2_layers(cls, model, core_rank, adapter_rank, device='cuda'):
-        """Recursively replace nn.Linear and Conv1D layers with ARWLinear."""
+        """Replace nn.Linear and Conv1D layers with ARWLinear."""
         for name, module in model.named_children():
-            # Skip lm_head (tied to embeddings)
-            if 'lm_head' in name:
+            if 'lm_head' in name:          # skip lm_head (tied to embeddings)
                 continue
 
-            # Detect either nn.Linear or the classic GPT-2 Conv1D
-            if isinstance(module, nn.Linear):
+            if hasattr(module, 'in_features') and module.__class__.__name__ != 'Conv1D':
+                # Standard nn.Linear
                 W = module.weight.data.clone()
                 bias = module.bias.data.clone() if module.bias is not None else None
-                arw = cls.from_weights(W, bias,
-                                       module.in_features,
-                                       module.out_features,
-                                       core_rank, adapter_rank, device)
-                setattr(model, name, arw)
+                in_feat = module.in_features
+                out_feat = module.out_features
 
             elif module.__class__.__name__ == 'Conv1D':
-                # Conv1D stores weight as (in_features, out_features) → transpose
-                W = module.weight.data.clone().t()  # now (out, in)
+                # GPT‑2 custom Conv1D: weight is (nx, nf) → transpose to (out, in)
+                W = module.weight.data.clone().t().contiguous()
                 bias = module.bias.data.clone() if module.bias is not None else None
-                arw = cls.from_weights(W, bias,
-                                       module.in_features,
-                                       module.out_features,
-                                       core_rank, adapter_rank, device)
-                setattr(model, name, arw)
+                in_feat = module.nx          # input features
+                out_feat = module.nf         # output features
 
             else:
+                # Recurse into child modules (e.g., GPT2Attention, GPT2MLP)
                 cls.convert_gpt2_layers(module, core_rank, adapter_rank, device)
+                continue
+
+            arw = ARWLinear.from_weights(W, bias, in_feat, out_feat,
+                                         core_rank, adapter_rank, device)
+            setattr(model, name, arw)
 
 # ---------------------------------------------------------------------------
 # Dataset helpers
