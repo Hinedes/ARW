@@ -76,11 +76,31 @@ class TextDataset(Dataset):
     def __len__(self):
         return len(self.input_ids)
 
-def prepare_wikitext(tokenizer, block_size=256, num_samples=5000):
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    texts = [x['text'] for x in dataset if len(x['text']) > 10][:num_samples*2]
-    enc = tokenizer(texts, return_tensors='pt', truncation=True, padding=True, max_length=block_size)
-    return TextDataset(enc)
+def prepare_fixed_eval(tokenizer, device, block_size=128):
+    text = (
+        "The quick brown fox jumps over the lazy dog. "
+        "She sells seashells by the seashore. "
+        "How much wood would a woodchuck chuck if a woodchuck could chuck wood? "
+        "Peter Piper picked a peck of pickled peppers. "
+        "A journey of a thousand miles begins with a single step. "
+        "To be or not to be, that is the question. "
+        "All that glitters is not gold. "
+        "The early bird catches the worm. "
+        "Actions speak louder than words. "
+        "Beauty is in the eye of the beholder."
+    ) * 5   # repeat to get enough tokens
+    enc = tokenizer(text, return_tensors='pt', truncation=True, padding='max_length', max_length=block_size)
+    # Simple dataset: one batch
+    class SingleBatch(Dataset):
+        def __init__(self, input_ids, mask):
+            self.input_ids = input_ids
+            self.attention_mask = mask
+        def __getitem__(self, idx):
+            return {'input_ids': self.input_ids[idx], 'attention_mask': self.attention_mask[idx]}
+        def __len__(self):
+            return len(self.input_ids)
+    mask = torch.ones_like(enc['input_ids'])
+    return SingleBatch(enc['input_ids'], mask)
 
 def prepare_python(tokenizer, block_size=256, num_samples=5000):
     try:
@@ -184,8 +204,8 @@ def main():
         raise RuntimeError("Model produces NaN/Inf before training – aborting.")
 
     # Data
-    en_eval = prepare_wikitext(tok, num_samples=500)
-    en_loader = DataLoader(en_eval, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=2)
+    en_eval = prepare_fixed_eval(tok, device)
+    en_loader = DataLoader(en_eval, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=0)
     py_train = prepare_python(tok, num_samples=args.domain1_samples)
     py_loader = DataLoader(py_train, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=2)
 
