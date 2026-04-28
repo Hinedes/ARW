@@ -200,9 +200,9 @@ def train(model, loader, opt, epochs, device):
             
             try:
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                labels = input_ids.clone()
-                labels[mask == 0] = -100
-                loss = model(input_ids, attention_mask=mask, labels=labels).loss
+                     labels = input_ids.clone()
+                     labels[mask == 0] = -100
+                     loss = model(input_ids, attention_mask=mask, labels=labels).loss
                     
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
