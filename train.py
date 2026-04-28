@@ -40,8 +40,8 @@ class ARWLinearFunction(torch.autograd.Function):
         ctx.save_for_backward(x, W0, bias, U_core, V_core, A, B, dW)
         return F.linear(x, W_eff, bias)
 
-        @staticmethod
-        def backward(ctx, grad_output):
+    @staticmethod
+    def backward(ctx, grad_output):
         x, W0, bias, U_core, V_core, A, B, dW = ctx.saved_tensors
         # Flatten the batch and sequence dimensions
         batch_size, seq_len, hidden = x.shape
