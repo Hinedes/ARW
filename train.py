@@ -220,7 +220,17 @@ def main():
     tok = GPT2TokenizerFast.from_pretrained(args.model_name); tok.pad_token = tok.eos_token
 
     model = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
-    ARWLinear.convert_gpt2_layers_adaptive(model, args.target_variance, args.adapter_rank, device)
+    try:
+        ARWLinear.convert_gpt2_layers_adaptive(model, args.target_variance, args.adapter_rank, device)
+    except RuntimeError as e:
+        display(f"Conversion failed: {e}")
+        display("Falling back to target_variance=0.90 (more memory-safe).")
+        del model
+        torch.cuda.empty_cache()
+        model = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
+        ARWLinear.convert_gpt2_layers_adaptive(model, 0.90, args.adapter_rank, device)
+    
+    display(f"VRAM used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
     # Freeze all except adapter
     for p in model.parameters(): p.requires_grad = False
@@ -232,11 +242,6 @@ def main():
             arw_cnt += 1
     trainable = [n for n,p in model.named_parameters() if p.requires_grad]
     display(f"ARW layers: {arw_cnt}, trainable params: {len(trainable)}")
-    
-    # Use PyTorch 2.0 compiler for faster execution on modern GPUs.
-    # We compile the model post-conversion.
-    display("Compiling model (may take a minute) ...")
-    model = torch.compile(model, mode="max-autotune")
 
     # ===== SANITY CHECK =====
     display("\n--- Sanity check: dummy input ---")
@@ -277,7 +282,6 @@ def main():
         torch.cuda.empty_cache()
 
         model_ft = GPT2LMHeadModel.from_pretrained(args.model_name).to(device)
-        model_ft = torch.compile(model_ft, mode="max-autotune")
         
         en_before_ft = evaluate_ppl(model_ft, en_loader, device, tag='FT Before')
         opt_ft = torch.optim.AdamW(model_ft.parameters(), lr=args.lr)
