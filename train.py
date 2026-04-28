@@ -143,14 +143,21 @@ def evaluate_ppl(model, dataloader, device, tag=''):
     for i, batch in enumerate(dataloader):
         input_ids = batch['input_ids'].to(device, non_blocking=True)
         mask = batch['attention_mask'].to(device, non_blocking=True)
-        
+
+        # Replace padding tokens with -100 so Hugging Face ignores them
+        labels = input_ids.clone()
+        labels[mask == 0] = -100
+
         try:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                out = model(input_ids, attention_mask=mask, labels=input_ids)
+                out = model(input_ids, attention_mask=mask, labels=labels)
                 loss = out.loss
-                
-            total_loss += loss.item() * mask.sum().item()
-            total_tokens += mask.sum().item()
+
+            # loss is already averaged over non‑ignored tokens by HF
+            # We'll accumulate total nats ourselves
+            num_valid = mask.sum().item()
+            total_loss += loss.item() * num_valid
+            total_tokens += num_valid
             if i == 0:
                 display(f"  {tag} first batch loss: {loss.item():.4f}")
         except torch.cuda.OutOfMemoryError:
