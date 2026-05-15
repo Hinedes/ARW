@@ -13,45 +13,21 @@ STEPS = 200
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-# --- 1. Load model, but focus on the LANGUAGE MODEL only ---
+# --- 1. Load model, extract language model and first layer ---
 config = AutoConfig.from_pretrained(MODEL_ID)
 model = Gemma4ForConditionalGeneration.from_pretrained(
     MODEL_ID, torch_dtype=torch.float32, device_map="auto"
 )
-
-# The text backbone is inside model.model.language_model
 text_model = model.model.language_model
-print(f"Type of text_model: {type(text_model)}")
-print("\nTop‑level children of text_model:")
-for name, child in text_model.named_children():
-    print(f"  {name}: {type(child)}")
-
-# Look for decoder layers
-if hasattr(text_model, 'layers'):
-    layers = text_model.layers
-elif hasattr(text_model, 'decoder') and hasattr(text_model.decoder, 'layers'):
-    layers = text_model.decoder.layers
-else:
-    # scan for a ModuleList with >10 items
-    layers = None
-    for name, module in text_model.named_modules():
-        if isinstance(module, nn.ModuleList) and len(module) > 10:
-            layers = module
-            print(f"Found layer ModuleList at: {name} ({len(module)} layers)")
-            break
-
-if layers is None:
-    raise RuntimeError("Could not locate decoder layers inside language model.")
-
+layers = text_model.layers          # nn.ModuleList of 42 decoder layers
 print(f"Number of layers: {len(layers)}")
 layer0 = layers[0]
 
-# --- 2. Verify PLE components exist ---
+# Verify PLE components
 assert hasattr(layer0, 'per_layer_input_gate'), "per_layer_input_gate missing"
 assert hasattr(layer0, 'per_layer_projection'), "per_layer_projection missing"
-print(f"Layer type: {type(layer0)}")
 
-# Freeze everything except PLE parameters
+# Freeze everything except PLE
 for name, param in layer0.named_parameters():
     if 'per_layer' not in name:
         param.requires_grad = False
@@ -59,7 +35,7 @@ for name, param in layer0.named_parameters():
         param.requires_grad = True
 layer0 = layer0.to(device)
 
-# --- 3. Orthogonal bases (same as before) ---
+# --- 2. Orthogonal bases ---
 def make_basis(seed, other_basis=None):
     g = torch.Generator(device=device).manual_seed(seed)
     G = torch.randn(H, K, generator=g, device=device)
@@ -74,30 +50,35 @@ Pi_A = P_A @ P_A.T
 Pi_B = P_B @ P_B.T
 assert torch.allclose(P_A.T @ P_B, torch.zeros(K, K, device=device), atol=1e-5)
 
-# --- 4. ARW hook ---
+# --- 3. ARW hook ---
 def make_arw_hook(Pi):
     def hook(grad):
         return grad @ Pi
     return hook
 
-# --- 5. Dummy input ---
+# --- 4. Prepare dummy input and proper position embeddings ---
 torch.manual_seed(0)
-x = torch.randn(4, 128, H, device=device)
-attn_mask = torch.ones(4, 1, 128, 128, device=device)
-pos_emb = torch.zeros(1, 128, H, device=device)
+batch, seq = 4, 128
+x = torch.randn(batch, seq, H, device=device)
 
-# Quick forward pass test
-try:
-    out_test = layer0(x, attention_mask=attn_mask, position_embeddings=pos_emb)
-    if isinstance(out_test, tuple): out_test = out_test[0]
-    print(f"Test forward shape: {out_test.shape}")
-except Exception as e:
-    print(f"Forward with pos_emb failed: {e}")
-    out_test = layer0(x, attention_mask=attn_mask)
-    if isinstance(out_test, tuple): out_test = out_test[0]
-    print(f"Fallback forward shape: {out_test.shape}")
+# Get rotary_emb module from text_model
+rotary_emb = text_model.rotary_emb
+# Compute position embeddings for seq_len=128, positions=0..127
+position_ids = torch.arange(seq, device=device).unsqueeze(0).repeat(batch, 1)  # (batch, seq)
+cos, sin = rotary_emb(x, position_ids)  # each (batch, seq, head_dim?) but can be used directly
+# They are now tensors of shape (batch, seq, head_dim), but the attention expects (batch, 1, seq, head_dim)? 
+# Actually, the Gemma4 attention forward expects cos/sin as tensors of shape (batch, seq, head_dim) and internally does unsqueezing.
+# Let's just keep them as they are and pass them as a tuple.
 
-# --- 6. Training function ---
+# For attention_mask, use causal mask (4D, bool)
+attn_mask = torch.ones(batch, 1, seq, seq, device=device, dtype=torch.bool).tril()  # causal
+
+# Test forward pass
+out_test = layer0(x, attention_mask=attn_mask, position_embeddings=(cos, sin))
+if isinstance(out_test, tuple): out_test = out_test[0]
+print(f"Test forward shape: {out_test.shape}")  # expected (4, 128, 2560)
+
+# --- 5. Training function ---
 def train_domain(layer, x, attn_mask, pos_emb, Pi, target, steps, desc):
     h1 = layer.per_layer_input_gate.weight.register_hook(make_arw_hook(Pi))
     h2 = layer.per_layer_projection.weight.register_hook(make_arw_hook(Pi))
@@ -105,10 +86,7 @@ def train_domain(layer, x, attn_mask, pos_emb, Pi, target, steps, desc):
     loss_fn = nn.MSELoss()
     for i in range(steps):
         opt.zero_grad()
-        try:
-            out = layer(x, attention_mask=attn_mask, position_embeddings=pos_emb)
-        except:
-            out = layer(x, attention_mask=attn_mask)
+        out = layer(x, attention_mask=attn_mask, position_embeddings=pos_emb)
         if isinstance(out, tuple): out = out[0]
         out_proj = out @ Pi
         loss = loss_fn(out_proj, target)
@@ -120,25 +98,25 @@ def train_domain(layer, x, attn_mask, pos_emb, Pi, target, steps, desc):
     h2.remove()
     return loss.item()
 
-target_A = torch.randn(4, 128, H, device=device) @ Pi_A
-target_B = torch.randn(4, 128, H, device=device) @ Pi_B
+target_A = torch.randn(batch, seq, H, device=device) @ Pi_A
+target_B = torch.randn(batch, seq, H, device=device) @ Pi_B
 
 print("\n=== Train Domain A ===")
-loss_A = train_domain(layer0, x, attn_mask, pos_emb, Pi_A, target_A, STEPS, "Domain A")
+loss_A = train_domain(layer0, x, attn_mask, (cos, sin), Pi_A, target_A, STEPS, "Domain A")
 print(f"Final loss A: {loss_A:.6f}")
 
 with torch.no_grad():
-    out = layer0(x, attention_mask=attn_mask, position_embeddings=pos_emb)
+    out = layer0(x, attention_mask=attn_mask, position_embeddings=(cos, sin))
     if isinstance(out, tuple): out = out[0]
     loss_A_init = nn.MSELoss()(out @ Pi_A, target_A).item()
 print(f"Retention loss before B: {loss_A_init:.8f}")
 
 print("\n=== Train Domain B ===")
-loss_B = train_domain(layer0, x, attn_mask, pos_emb, Pi_B, target_B, STEPS, "Domain B")
+loss_B = train_domain(layer0, x, attn_mask, (cos, sin), Pi_B, target_B, STEPS, "Domain B")
 print(f"Final loss B: {loss_B:.6f}")
 
 with torch.no_grad():
-    out = layer0(x, attention_mask=attn_mask, position_embeddings=pos_emb)
+    out = layer0(x, attention_mask=attn_mask, position_embeddings=(cos, sin))
     if isinstance(out, tuple): out = out[0]
     loss_A_final = nn.MSELoss()(out @ Pi_A, target_A).item()
 print(f"Retention loss after B: {loss_A_final:.8f}")
