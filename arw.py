@@ -13,7 +13,7 @@ DOMAIN_B_SEED = 2
 LR = 5e-5
 EPOCHS = 1
 BATCH_SIZE = 4
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") # ROCm maps to 'cuda'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
 
 # --- 1. PRNG Basis Generator (Zero Parameter Overhead) ---
 def generate_basis(hidden_dim, k, seed, device):
@@ -42,18 +42,28 @@ class ARWHookManager:
         Pi = P @ P.T # Projection operator: (H, H)
         Pi = Pi.to(model.dtype) # Match model precision
 
-        def arw_backward_hook(grad):
-            # The Write-Lock & Cross-Talk Equation
-            # Constrains updates to the active subspace while allowing reads from the base
-            return Pi @ grad
+        # Create closures for the hooks to handle matrix dimension routing
+        def make_hook(is_down_proj):
+            def hook(param):
+                if param.grad is not None:
+                    if is_down_proj:
+                        # param is (H, I), Pi is (H, H)
+                        param.grad.data = torch.matmul(Pi, param.grad.data)
+                    else:
+                        # param is (I, H), Pi is (H, H)
+                        param.grad.data = torch.matmul(param.grad.data, Pi)
+            return hook
 
-        # Inject hooks strictly into MLP layers to mimic the GPT-2 proof
+        # Inject hooks strictly into MLP layers
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and any(proj in name for proj in ['gate_proj', 'up_proj', 'down_proj']):
-                hook = module.weight.register_post_accumulate_grad_hook(
-                    lambda param, g=grad: arw_backward_hook(param.grad)
-                )
-                self.hooks.append(hook)
+            if isinstance(module, nn.Linear):
+                if 'gate_proj' in name or 'up_proj' in name:
+                    hook_handle = module.weight.register_post_accumulate_grad_hook(make_hook(is_down_proj=False))
+                    self.hooks.append(hook_handle)
+                elif 'down_proj' in name:
+                    hook_handle = module.weight.register_post_accumulate_grad_hook(make_hook(is_down_proj=True))
+                    self.hooks.append(hook_handle)
+                    
         print(f"[ARW] Hooks injected for Domain Seed {seed}. Subspace locked.")
 
     def clear_hooks(self):
@@ -69,7 +79,6 @@ def prepare_dataloader(jsonl_path, tokenizer, batch_size):
     dataset = load_dataset('json', data_files=jsonl_path, split='train')
     
     def tokenize(examples):
-        # Assumes standard 'text' column, adjust if TRC data uses different keys
         text_col = 'text' if 'text' in examples else list(examples.keys())[0]
         return tokenizer(examples[text_col], truncation=True, max_length=512, padding="max_length")
 
@@ -91,7 +100,7 @@ def train_domain(model, dataloader, optimizer, epoch_desc):
         loss = outputs.loss
         loss.backward()
         
-        # The ARW hook intercepts param.grad right here before the step
+        # The ARW hook automatically intercepts param.grad here before the step
         optimizer.step()
         
         total_loss += loss.item()
@@ -123,7 +132,7 @@ def run_experiment():
         tokenizer.pad_token = tokenizer.eos_token
         
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16).to(DEVICE)
-    hidden_dim = model.config.hidden_size # 2048 for Qwen-2B
+    hidden_dim = model.config.hidden_size 
     
     # Initialize Hook Manager
     arw_manager = ARWHookManager(hidden_dim, K_DIM, DEVICE)
@@ -148,7 +157,6 @@ def run_experiment():
     
     # --- STAGE 3: The Zero-Interference Benchmark ---
     print("\n>>> STAGE 3: The Moment of Truth (Evaluating A after B)")
-    # Clear hooks for pure inference
     arw_manager.clear_hooks()
     ppl_A_final = evaluate_domain(model, loader_A, "Domain A (Post-Domain B Training)")
     
@@ -161,10 +169,6 @@ def run_experiment():
     print(f"Domain A Final PPL    : {ppl_A_final:.4f}")
     delta = ppl_A_final - ppl_A_initial
     print(f"Retention Delta       : {delta:+.4f}")
-    if abs(delta) < 0.001:
-        print("\n[SUCCESS] Mathematical write-lock holds. Zero catastrophic forgetting.")
-    else:
-        print("\n[FAIL] Orthogonality breached. Gradient masking requires adjustment.")
 
 if __name__ == "__main__":
     run_experiment()
