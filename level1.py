@@ -13,59 +13,45 @@ STEPS = 200
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-# --- 1. Load model ---
+# --- 1. Load model, but focus on the LANGUAGE MODEL only ---
 config = AutoConfig.from_pretrained(MODEL_ID)
 model = Gemma4ForConditionalGeneration.from_pretrained(
     MODEL_ID, torch_dtype=torch.float32, device_map="auto"
 )
 
-# --- 2. Explore the model structure ---
-base_model = model.model
-print(f"Type of base_model: {type(base_model)}")
-print("\nTop‑level children of base_model:")
-for name, child in base_model.named_children():
+# The text backbone is inside model.model.language_model
+text_model = model.model.language_model
+print(f"Type of text_model: {type(text_model)}")
+print("\nTop‑level children of text_model:")
+for name, child in text_model.named_children():
     print(f"  {name}: {type(child)}")
 
-# Try to find any list of layers
-layer_paths = [
-    ("base_model.layers", lambda m: m.model.layers),
-    ("base_model.decoder.layers", lambda m: m.model.decoder.layers),
-    ("base_model.transformer.layers", lambda m: m.model.transformer.layers),
-    ("base_model.model.layers", lambda m: m.model.model.layers),
-]
-
-found_layers = None
-for path, accessor in layer_paths:
-    try:
-        layers = accessor(model)  # we pass the whole model to accessor
-        if isinstance(layers, (list, nn.ModuleList)):
-            found_layers = layers
-            print(f"\nFound layers via: {path}")
-            break
-    except:
-        continue
-
-if found_layers is None:
-    # Last resort: iterate over all children and find the first that looks like a list of layers
-    print("\nManually scanning for layer list...")
-    for name, module in base_model.named_modules():
-        if isinstance(module, nn.ModuleList) and len(module) > 10:
-            found_layers = module
-            print(f"Found ModuleList with {len(module)} items at {name}")
-            break
-
-if found_layers is None:
-    raise RuntimeError("Could not locate decoder layers. Please inspect the printed children list.")
+# Look for decoder layers
+if hasattr(text_model, 'layers'):
+    layers = text_model.layers
+elif hasattr(text_model, 'decoder') and hasattr(text_model.decoder, 'layers'):
+    layers = text_model.decoder.layers
 else:
-    print(f"Number of layers: {len(found_layers)}")
-    layer0 = found_layers[0]
+    # scan for a ModuleList with >10 items
+    layers = None
+    for name, module in text_model.named_modules():
+        if isinstance(module, nn.ModuleList) and len(module) > 10:
+            layers = module
+            print(f"Found layer ModuleList at: {name} ({len(module)} layers)")
+            break
 
-# --- 3. Verify PLE components in layer0 ---
+if layers is None:
+    raise RuntimeError("Could not locate decoder layers inside language model.")
+
+print(f"Number of layers: {len(layers)}")
+layer0 = layers[0]
+
+# --- 2. Verify PLE components exist ---
 assert hasattr(layer0, 'per_layer_input_gate'), "per_layer_input_gate missing"
 assert hasattr(layer0, 'per_layer_projection'), "per_layer_projection missing"
 print(f"Layer type: {type(layer0)}")
 
-# Freeze everything except PLE
+# Freeze everything except PLE parameters
 for name, param in layer0.named_parameters():
     if 'per_layer' not in name:
         param.requires_grad = False
@@ -73,7 +59,7 @@ for name, param in layer0.named_parameters():
         param.requires_grad = True
 layer0 = layer0.to(device)
 
-# --- 4. Orthogonal bases (unchanged) ---
+# --- 3. Orthogonal bases (same as before) ---
 def make_basis(seed, other_basis=None):
     g = torch.Generator(device=device).manual_seed(seed)
     G = torch.randn(H, K, generator=g, device=device)
@@ -88,32 +74,30 @@ Pi_A = P_A @ P_A.T
 Pi_B = P_B @ P_B.T
 assert torch.allclose(P_A.T @ P_B, torch.zeros(K, K, device=device), atol=1e-5)
 
-# --- 5. ARW hook ---
+# --- 4. ARW hook ---
 def make_arw_hook(Pi):
     def hook(grad):
         return grad @ Pi
     return hook
 
-# --- 6. Dummy input ---
+# --- 5. Dummy input ---
 torch.manual_seed(0)
 x = torch.randn(4, 128, H, device=device)
 attn_mask = torch.ones(4, 1, 128, 128, device=device)
 pos_emb = torch.zeros(1, 128, H, device=device)
 
-# Quick test to see if layer forward works
+# Quick forward pass test
 try:
     out_test = layer0(x, attention_mask=attn_mask, position_embeddings=pos_emb)
-    if isinstance(out_test, tuple):
-        out_test = out_test[0]
+    if isinstance(out_test, tuple): out_test = out_test[0]
     print(f"Test forward shape: {out_test.shape}")
 except Exception as e:
-    print(f"Forward failed with position_embeddings: {e}")
+    print(f"Forward with pos_emb failed: {e}")
     out_test = layer0(x, attention_mask=attn_mask)
-    if isinstance(out_test, tuple):
-        out_test = out_test[0]
+    if isinstance(out_test, tuple): out_test = out_test[0]
     print(f"Fallback forward shape: {out_test.shape}")
 
-# --- 7. Training ---
+# --- 6. Training function ---
 def train_domain(layer, x, attn_mask, pos_emb, Pi, target, steps, desc):
     h1 = layer.per_layer_input_gate.weight.register_hook(make_arw_hook(Pi))
     h2 = layer.per_layer_projection.weight.register_hook(make_arw_hook(Pi))
@@ -125,8 +109,7 @@ def train_domain(layer, x, attn_mask, pos_emb, Pi, target, steps, desc):
             out = layer(x, attention_mask=attn_mask, position_embeddings=pos_emb)
         except:
             out = layer(x, attention_mask=attn_mask)
-        if isinstance(out, tuple):
-            out = out[0]
+        if isinstance(out, tuple): out = out[0]
         out_proj = out @ Pi
         loss = loss_fn(out_proj, target)
         loss.backward()
