@@ -1,89 +1,70 @@
 import torch
 import torch.nn as nn
 
-# ------------------------------
-# Level 0 – ARW on a single PLE‑like projection
-# ------------------------------
-
-H = 2560          # hidden size
-K = 64            # subspace dimension
-L = 256           # PLE projection output dim (per_layer_projection)
+H = 2560
+K = 64
+L = 256
 SEED_A = 1
 SEED_B = 2
 LR = 0.01
-STEPS = 200       # enough to converge on a simple regression
+STEPS = 200
 
-# Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+print(f"Device: {device}")
 
-# --- 1. Generate two exactly orthogonal bases ---
+# --- 1. Orthogonal bases ---
 def make_basis(seed, other_basis=None):
-    """Generate orthonormal basis (H, k). If other_basis given, ensure orthogonality."""
     g = torch.Generator(device=device).manual_seed(seed)
     G = torch.randn(H, K, generator=g, device=device)
     if other_basis is not None:
-        # Remove projection onto other_basis
-        proj = other_basis @ (other_basis.T @ G)
-        G = G - proj
+        G = G - other_basis @ (other_basis.T @ G)   # remove projection onto other basis
     Q, _ = torch.linalg.qr(G)
     return Q
 
 P_A = make_basis(SEED_A)
-P_B = make_basis(SEED_B, other_basis=P_A)   # ensures P_B ⊥ P_A
+P_B = make_basis(SEED_B, other_basis=P_A)
+assert torch.allclose(P_A.T @ P_B, torch.zeros(K, K, device=device), atol=1e-5)
+print("Bases orthogonal.")
 
-# Verify orthogonality
-assert torch.allclose(P_A.T @ P_B, torch.zeros(K, K, device=device), atol=1e-5), "Bases not orthogonal!"
-print("Bases are perfectly orthogonal.")
-
-# Projection matrices
-Pi_A = P_A @ P_A.T   # (H, H)
+Pi_A = P_A @ P_A.T
 Pi_B = P_B @ P_B.T
 
-# --- 2. Define the linear layer (down‑proj style: H → L) ---
+# --- 2. Linear layer (down-proj style) ---
 layer = nn.Linear(H, L, bias=False).to(device)
-# Store initial weights for later comparison
 W_init = layer.weight.data.clone()
 
-# --- 3. ARW gradient hook ---
+# --- 3. ARW hook (write projection) ---
 def make_arw_hook(Pi):
     def hook(grad):
-        # For a down_proj (output dim L, input dim H), weight shape is (L, H).
-        # Gradient w.r.t. weight is (L, H), but we need to restrict the *input* subspace
-        # (the hidden side). The hidden dimension is the second dimension (columns).
-        # We want to zero out gradients that would change the mapping from the subspace
-        # outside Pi's span. So we multiply grad_W @ Pi^T = grad_W @ Pi (since Pi is symmetric).
-        return grad @ Pi
+        return grad @ Pi   # projects each row's weight gradient onto the active subspace
     return hook
 
-# --- 4. Synthetic data for two domains ---
-# Domain A: input x → target y_A
-# Domain B: input x → target y_B
+# --- 4. Synthetic data ---
 torch.manual_seed(0)
-x = torch.randn(128, H, device=device)   # batch of 128 vectors
+x = torch.randn(128, H, device=device)   # full-space input
 
-# Two arbitrary linear mappings (represented by matrices in the A and B subspaces)
-M_A = torch.randn(L, K, device=device)   # domain A mapping in A's basis
-M_B = torch.randn(L, K, device=device)   # domain B mapping in B's basis
+# Mappings defined only in respective subspaces
+M_A = torch.randn(L, K, device=device)
+M_B = torch.randn(L, K, device=device)
 
-# Targets = M_A @ (P_A.T @ x)  (only uses A subspace) + M_B @ (P_B.T @ x) (only B subspace)
-# For training A, we set target_A = M_A @ (P_A.T @ x) + noise, ignoring B subspace.
-# For training B, target_B = M_B @ (P_B.T @ x) + noise.
-target_A = (M_A @ (P_A.T @ x.T)).T  # (128, L)
-target_B = (M_B @ (P_B.T @ x.T)).T
+# Projected inputs (read projections)
+x_A = x @ Pi_A   # (128, H)  -- only A subspace components
+x_B = x @ Pi_B
 
-# Add tiny noise to avoid exact zero loss
-target_A += 0.001 * torch.randn_like(target_A)
-target_B += 0.001 * torch.randn_like(target_B)
+# Targets (noise-free to see perfect retention)
+target_A = (M_A @ (P_A.T @ x.T)).T   # = (M_A @ (P_A.T @ x.T))^T, but we can also compute via x_A
+# Actually, target_A should be M_A @ (P_A.T @ x) = (x @ P_A @ M_A.T) but shape (128, L). Let's use: target_A = x_A @ P_A @ M_A.T? Wait, x_A = x @ Pi_A = x @ P_A @ P_A.T. Then x_A @ P_A = x @ P_A @ P_A.T @ P_A = x @ P_A. So target_A = (x @ P_A) @ M_A.T. We'll compute as:
+target_A = (x @ P_A) @ M_A.T   # (128, L)
+target_B = (x @ P_B) @ M_B.T
 
-# --- 5. Training procedure ---
-def train_domain(layer, x, target, Pi, steps, desc):
+# --- 5. Training with read projection ---
+def train_domain(layer, x_proj, target, Pi, steps, desc):
     opt = torch.optim.SGD(layer.parameters(), lr=LR)
     hook_handle = layer.weight.register_hook(make_arw_hook(Pi))
     loss_fn = nn.MSELoss()
     for i in range(steps):
         opt.zero_grad()
-        out = layer(x)
+        out = layer(x_proj)          # read: project input before layer
         loss = loss_fn(out, target)
         loss.backward()
         opt.step()
@@ -92,40 +73,37 @@ def train_domain(layer, x, target, Pi, steps, desc):
     hook_handle.remove()
     return loss.item()
 
-# --- 6. Run experiment ---
-print("\n=== Training Domain A ===")
-loss_A_before = train_domain(layer, x, target_A, Pi_A, STEPS, "Domain A")
-print(f"Domain A final loss: {loss_A_before:.6f}")
+print("\n=== Train Domain A (read A, write A) ===")
+loss_A = train_domain(layer, x_A, target_A, Pi_A, STEPS, "Domain A")
+print(f"Domain A final loss: {loss_A:.6f}")
 
-# Evaluate Domain A loss right after
+# Evaluate A with read projection A
 with torch.no_grad():
-    out_A = layer(x)
-    loss_A_initial = nn.MSELoss()(out_A, target_A).item()
-print(f"Domain A retention loss (before B): {loss_A_initial:.6f}")
+    pred_A = layer(x_A)
+    loss_A_init = nn.MSELoss()(pred_A, target_A).item()
+print(f"Domain A retention loss (before B): {loss_A_init:.8f}")
 
-print("\n=== Training Domain B ===")
-loss_B = train_domain(layer, x, target_B, Pi_B, STEPS, "Domain B")
+print("\n=== Train Domain B (read B, write B) ===")
+loss_B = train_domain(layer, x_B, target_B, Pi_B, STEPS, "Domain B")
 print(f"Domain B final loss: {loss_B:.6f}")
 
-# Evaluate Domain A after B training
+# Evaluate A again with read projection A
 with torch.no_grad():
-    out_A_after = layer(x)
-    loss_A_final = nn.MSELoss()(out_A_after, target_A).item()
-print(f"\nDomain A retention loss (after B): {loss_A_final:.6f}")
-
-delta = loss_A_final - loss_A_initial
+    pred_A_after = layer(x_A)
+    loss_A_final = nn.MSELoss()(pred_A_after, target_A).item()
+print(f"Domain A retention loss (after B): {loss_A_final:.8f}")
+delta = loss_A_final - loss_A_init
 print(f"Delta: {delta:+.8f}")
 
-# --- 7. Verify isolation numerically ---
-# The weight update after B training should lie entirely in Pi_B's subspace.
-# So the projection of the update onto Pi_A should be negligible.
+# Check weight update isolation
 W_after = layer.weight.data
 W_update = W_after - W_init
-# For down_proj, the update should satisfy: W_update @ Pi_A ≈ 0
-proj_A_update = torch.norm(W_update @ Pi_A) / torch.norm(W_update)
-print(f"\nFraction of weight update projecting onto Domain A subspace: {proj_A_update:.8f} (should be ~0)")
+proj_A_norm = torch.norm(W_update @ Pi_A) / torch.norm(W_update)
+proj_B_norm = torch.norm(W_update @ Pi_B) / torch.norm(W_update)
+print(f"\nWeight update projection onto A subspace: {proj_A_norm:.4f}")
+print(f"Weight update projection onto B subspace: {proj_B_norm:.4f}")
 
 if abs(delta) < 1e-5:
-    print("\n✅ SUCCESS: Domain A knowledge perfectly retained after Domain B training.")
+    print("\n✅ PERFECT RETENTION: ARW (read + write) isolates domains.")
 else:
-    print(f"\n⚠️  Retention not perfect (delta={delta}). Check projection orthogonality.")
+    print(f"\n⚠️ Delta={delta} – check read projection.")
