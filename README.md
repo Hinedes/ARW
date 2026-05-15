@@ -7,7 +7,7 @@ When a model is fine-tuned on a new domain, ARW lets it read all prior knowledge
 ## Status
 - [x] Mathematical formulation (split projectors)
 - [x] GPT-2 proof-of-concept: Domain 0 retention +0.000, Domain 1 PPL 8.643
-- [ ] Overnight cluster experiment (5070 Ti + 4080 Super)
+- [ ] Overnight cluster experiment 
 - [ ] Jailbreak-resistance test
 - [ ] Paper draft
 
