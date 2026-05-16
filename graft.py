@@ -15,6 +15,9 @@ BATCH_SIZE = 1
 MAX_LEN = 128
 EVAL_SPLIT = 0.9
 
+GRAFT_PATH = "graft_B.pt"
+GRAFT_META_PATH = "graft_B_meta.pt"
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
@@ -29,7 +32,7 @@ print("Loading Model in strict float32...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, 
     dtype=torch.float32
-).to(device) # Drop device_map="auto"
+).to(device)
 
 # THE SLEDGEHAMMER: Force physical 32-bit memory
 model = model.float()
@@ -63,8 +66,8 @@ class ARWManager:
     def __init__(self, hidden_dim, device):
         self.hidden_dim = hidden_dim
         self.device = device
-        self.Pi_write = None   # float32
-        self.Pi_blind = None   # float32
+        self.Pi_write = None
+        self.Pi_blind = None
         self.backward_hooks = []
         self.forward_hooks = []
         self.discard_stats = []
@@ -81,7 +84,6 @@ class ARWManager:
 
         def make_backward_hook(Pi_f32):
             def hook(grad):
-                # CRITICAL: upcast to float32, project, downcast back
                 g_f32 = grad.to(torch.float32)
                 if g_f32.shape[0] == Pi_f32.shape[0]:
                     active = Pi_f32 @ g_f32
@@ -89,7 +91,6 @@ class ARWManager:
                     active = g_f32 @ Pi_f32
                 else:
                     return grad
-                # Log discard ratio
                 discarded = g_f32 - active
                 tn = torch.norm(g_f32)
                 dn = torch.norm(discarded)
@@ -172,20 +173,13 @@ def train_domain(model, loader, opt, desc, steps, Pi_write_f32):
             Pi = Pi_write_f32.to(torch.float32)
             for name, param in model.named_parameters():
                 if name in old_weights:
-                    # 1. Compute raw delta strictly in float32
                     raw_update = (param - old_weights[name]).to(torch.float32)
-
-                    # 2. Enforce strict geometric layout mapping
                     if 'gate_proj' in name or 'up_proj' in name:
-                        # Input dimension is H (cols). Project via right-multiply.
                         projected_update = raw_update @ Pi
                     elif 'down_proj' in name:
-                        # Output dimension is H (rows). Project via left-multiply.
                         projected_update = Pi @ raw_update
                     else:
                         continue
-
-                    # 3. Write back to parameter tensor
                     param.copy_(old_weights[name] + projected_update.to(model.dtype))
 
             if step == 0:
@@ -201,11 +195,11 @@ def train_domain(model, loader, opt, desc, steps, Pi_write_f32):
                         out_of_subspace = diff - in_subspace
                         ratio = torch.norm(out_of_subspace) / (torch.norm(diff) + 1e-10)
                         print(f"[PROJECTION CHECK] {n}: out-of-subspace ratio = {ratio.item():.8f}")
-                        break  # one layer is enough
+                        break
 
         if step % 40 == 0:
             print(f"{desc} | Step {step:3d} | Loss: {loss.item():.4f}")
-            
+
 
 @torch.no_grad()
 def evaluate(model, loader, desc):
@@ -221,7 +215,7 @@ def evaluate(model, loader, desc):
     return ppl
 
 # ------------------------------
-# 6. Corrected Diagnostics
+# 6. Diagnostics
 # ------------------------------
 @torch.no_grad()
 def compute_weight_update_leak(model, before_weights, Pi_A_f32):
@@ -230,7 +224,6 @@ def compute_weight_update_leak(model, before_weights, Pi_A_f32):
         if name not in before_weights or param.ndim != 2:
             continue
         diff = param - before_weights[name].to(device)
-        # Cast to float32 for the diagnostic
         diff_f32 = diff.to(torch.float32)
         if param.shape[0] == Pi_A_f32.shape[0]:
             leak = Pi_A_f32 @ diff_f32
@@ -252,7 +245,6 @@ def weight_leak_float32_params(model, before_weights, Pi_A_f32):
     for name, param in model.named_parameters():
         if name not in before_weights or param.ndim != 2:
             continue
-        # Upcast both current and baseline to float32
         current = param.to(torch.float32)
         before = before_weights[name].to(device).to(torch.float32)
         diff = current - before
@@ -288,7 +280,143 @@ def ablation_correct(model, loader, Pi_B_f32, weights_post_A, desc):
     return ppl
 
 # ------------------------------
-# 7. The Experiment
+# 7. Grafting: Extraction
+# ------------------------------
+@torch.no_grad()
+def extract_graft(model, weights_post_A, Pi_B_f32, graft_path, meta_path):
+    """
+    Extract Domain B's graft from the trained model.
+    The graft is the projection of ΔW onto Pi_B for each FFN layer.
+    Only the non-zero subspace component is stored.
+    weights_post_A is the snapshot taken after Domain A training,
+    before Domain B training began.
+    """
+    print("\n>>> EXTRACTING GRAFT B...")
+    graft = {}
+    total_params = 0
+    total_nonzero = 0
+
+    for name, param in model.named_parameters():
+        if name not in weights_post_A or param.ndim != 2:
+            continue
+        if not any(x in name for x in ['gate_proj', 'up_proj', 'down_proj']):
+            continue
+
+        # ΔW: what changed between post-A and post-B
+        delta = (param.to(torch.float32) - weights_post_A[name].to(device).to(torch.float32))
+
+        # Project strictly onto Pi_B subspace
+        if 'gate_proj' in name or 'up_proj' in name:
+            # Input dimension H: right-multiply
+            delta_in_B = delta @ Pi_B_f32
+        elif 'down_proj' in name:
+            # Output dimension H: left-multiply
+            delta_in_B = Pi_B_f32 @ delta
+
+        # Store on CPU to save VRAM
+        graft[name] = delta_in_B.cpu()
+
+        n_params = delta_in_B.numel()
+        n_nonzero = (delta_in_B.abs() > 1e-9).sum().item()
+        total_params += n_params
+        total_nonzero += n_nonzero
+
+    # Metadata: everything needed to reinstall without the training script
+    meta = {
+        'model_id': MODEL_ID,
+        'hidden_dim': H,
+        'rank_k': K,
+        'master_seed': MASTER_SEED,
+        'domain': 'B',
+        'Pi_B': Pi_B_f32.cpu(),  # Store projection matrix for reinstallation
+        'layer_names': list(graft.keys()),
+    }
+
+    torch.save(graft, graft_path)
+    torch.save(meta, meta_path)
+
+    sparsity = 1.0 - (total_nonzero / total_params)
+    graft_size_mb = sum(v.numel() * 4 for v in graft.values()) / (1024 ** 2)
+
+    print(f"[GRAFT] Layers extracted   : {len(graft)}")
+    print(f"[GRAFT] Total parameters   : {total_params:,}")
+    print(f"[GRAFT] Non-zero entries   : {total_nonzero:,}")
+    print(f"[GRAFT] Effective sparsity : {sparsity:.4f} ({sparsity*100:.2f}%)")
+    print(f"[GRAFT] Artifact size      : {graft_size_mb:.2f} MB")
+    print(f"[GRAFT] Saved to           : {graft_path}")
+    print(f"[GRAFT] Meta saved to      : {meta_path}")
+    return graft, meta
+
+
+# ------------------------------
+# 8. Grafting: Reinstallation onto a fresh model
+# ------------------------------
+@torch.no_grad()
+def reinstall_graft_and_evaluate(graft_path, meta_path, eval_loader, desc):
+    """
+    Load a completely fresh base model with no training history.
+    Install the graft via W_active = W_base + ΔW_graft.
+    Evaluate. If PPL recovers to ~ppl_B_base, Grafting is proven end to end.
+    No hooks. No ARW. Just a matrix addition and a standard forward pass.
+    """
+    print(f"\n>>> REINSTALLATION TEST: Loading fresh {MODEL_ID}...")
+    meta = torch.load(meta_path, map_location='cpu')
+    graft = torch.load(graft_path, map_location='cpu')
+
+    # Verify metadata integrity
+    assert meta['model_id'] == MODEL_ID, "Model ID mismatch. Graft is not compatible with this model family."
+    assert meta['master_seed'] == MASTER_SEED, "Seed mismatch. Subspace geometry is inconsistent."
+    print(f"[REINSTALL] Graft metadata verified. Domain: {meta['domain']}, Seed: {meta['master_seed']}, K: {meta['rank_k']}")
+
+    # Fresh base model, completely untrained
+    fresh_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        dtype=torch.float32
+    ).to(device)
+    fresh_model = fresh_model.float()
+    fresh_model.eval()
+
+    # Baseline PPL of the fresh model on Domain B before graft
+    print("[REINSTALL] Evaluating fresh model BEFORE graft installation...")
+    ppl_before = evaluate(fresh_model, eval_loader, f"{desc} (Fresh Base, No Graft)")
+
+    # Install graft: W_active = W_base + ΔW_graft
+    # No hooks, no routing, no adapter. Pure matrix addition.
+    installed_count = 0
+    for name, param in fresh_model.named_parameters():
+        if name in graft:
+            delta = graft[name].to(device).to(torch.float32)
+            param.add_(delta)
+            installed_count += 1
+
+    print(f"[REINSTALL] Installed graft into {installed_count} layers via W_base + ΔW_graft.")
+
+    # PPL after graft installation
+    print("[REINSTALL] Evaluating fresh model AFTER graft installation...")
+    ppl_after = evaluate(fresh_model, eval_loader, f"{desc} (Fresh Base + Graft B)")
+
+    # Verify forward pass is standard (no hooks present)
+    n_hooks = sum(
+        len(m._forward_hooks) + len(m._backward_hooks)
+        for m in fresh_model.modules()
+    )
+    print(f"[REINSTALL] Active hooks on reinstalled model: {n_hooks} (must be 0)")
+
+    print(f"\n[REINSTALL VERDICT]")
+    print(f"  Fresh base PPL (no graft)  : {ppl_before:.4f}")
+    print(f"  After graft installation   : {ppl_after:.4f}")
+    print(f"  PPL delta                  : {ppl_after - ppl_before:+.4f}")
+    print(f"  Target (original B training): see ppl_B_base above")
+
+    # Clean up VRAM
+    del fresh_model
+    torch.cuda.empty_cache()
+
+    return ppl_before, ppl_after
+
+
+# ------------------------------
+# 9. The Experiment
 # ------------------------------
 arw = ARWManager(H, device)
 
@@ -316,13 +444,30 @@ weight_leak_float32_params(model, weights_post_A, Pi_A)
 ppl_A_after = evaluate(model, eval_A, "Domain A (After B, natural)")
 ppl_A_ablat = ablation_correct(model, eval_A, Pi_B, weights_post_A, "Domain A (B delta removed)")
 
+print("\n>>> STAGE 4: Graft Extraction")
+graft, meta = extract_graft(model, weights_post_A, Pi_B, GRAFT_PATH, GRAFT_META_PATH)
+
+print("\n>>> STAGE 5: Graft Reinstallation (End-to-End Proof)")
+ppl_fresh_before, ppl_fresh_after = reinstall_graft_and_evaluate(
+    GRAFT_PATH, GRAFT_META_PATH, eval_B, "Domain B"
+)
+
+# ------------------------------
+# 10. Final Verdict
+# ------------------------------
 print("\n" + "="*60)
-print("FINAL VERDICT (True ARW)")
+print("FINAL VERDICT (Grafting End-to-End)")
 print("="*60)
-print(f"Orthogonality (float32): {overlap:.2e}")
-print(f"Domain A Baseline : {ppl_A_base:.4f}")
-print(f"Domain B PPL      : {ppl_B_base:.4f}")
-print(f"Domain A After B  : {ppl_A_after:.4f}")
-print(f"Domain A Ablated  : {ppl_A_ablat:.4f}")
-print(f"Retention Delta   : {ppl_A_after - ppl_A_base:+.4f}")
-print(f"Ablation Delta    : {ppl_A_ablat - ppl_A_after:+.4f}")
+print(f"Orthogonality (float32)        : {overlap:.2e}")
+print(f"Domain A Baseline              : {ppl_A_base:.4f}")
+print(f"Domain B PPL (trained)         : {ppl_B_base:.4f}")
+print(f"Domain A After B               : {ppl_A_after:.4f}")
+print(f"Domain A Ablated               : {ppl_A_ablat:.4f}")
+print(f"Retention Delta                : {ppl_A_after - ppl_A_base:+.4f}")
+print(f"Ablation Delta                 : {ppl_A_ablat - ppl_A_after:+.4f}")
+print(f"--- Grafting ---")
+print(f"Fresh Base PPL (no graft)      : {ppl_fresh_before:.4f}")
+print(f"Fresh Base PPL (graft installed): {ppl_fresh_after:.4f}")
+recovery = ppl_B_base - ppl_fresh_after
+print(f"PPL gap vs trained model       : {recovery:+.4f}  ({'PASS' if abs(recovery) < 1.0 else 'INVESTIGATE'})")
+print("="*60)
