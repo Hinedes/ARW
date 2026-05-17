@@ -321,14 +321,17 @@ def extract_graft(model, weights_post_A, Pi_B_f32, graft_path, meta_path):
         total_params += n_params
         total_nonzero += n_nonzero
 
-    # Metadata: everything needed to reinstall without the training script
+    # Metadata: everything needed to reinstall without the training script.
+    # Pi_B is NOT stored here — it is regenerated from seed at load time.
+    # This keeps the meta file weights_only=True compatible and avoids
+    # device mismatch when deserializing CUDA tensors across sessions.
     meta = {
         'model_id': MODEL_ID,
         'hidden_dim': H,
         'rank_k': K,
         'master_seed': MASTER_SEED,
         'domain': 'B',
-        'Pi_B': Pi_B_f32.cpu(),  # Store projection matrix for reinstallation
+        'domain_index': 1,  # B is the second domain (index 1) in the QR pair
         'layer_names': list(graft.keys()),
     }
 
@@ -360,18 +363,34 @@ def reinstall_graft_and_evaluate(graft_path, meta_path, eval_loader, desc):
     No hooks. No ARW. Just a matrix addition and a standard forward pass.
     """
     print(f"\n>>> REINSTALLATION TEST: Loading fresh {MODEL_ID}...")
-    meta = torch.load(meta_path, map_location='cpu')
-    graft = torch.load(graft_path, map_location='cpu')
+
+    # weights_only=True is safe here: meta contains only primitives, no tensors.
+    # Pi_B is regenerated from seed below rather than stored in the file,
+    # which avoids CUDA device mismatch on deserialization across sessions.
+    meta = torch.load(meta_path, map_location='cpu', weights_only=True)
+    graft = torch.load(graft_path, map_location='cpu', weights_only=True)
 
     # Verify metadata integrity
     assert meta['model_id'] == MODEL_ID, "Model ID mismatch. Graft is not compatible with this model family."
     assert meta['master_seed'] == MASTER_SEED, "Seed mismatch. Subspace geometry is inconsistent."
+    assert meta['hidden_dim'] == H and meta['rank_k'] == K, "Dimension mismatch."
     print(f"[REINSTALL] Graft metadata verified. Domain: {meta['domain']}, Seed: {meta['master_seed']}, K: {meta['rank_k']}")
 
-    # Fresh base model, completely untrained
+    # Issue 4: Explicitly free the trained model from VRAM before loading fresh.
+    # Two Qwen 3.5 2B float32 models cannot coexist on a single GPU.
+    # Caller must delete the trained model before calling this function.
+    # Confirm VRAM headroom.
+    if torch.cuda.is_available():
+        free_vram = torch.cuda.mem_get_info()[0] / (1024**3)
+        print(f"[REINSTALL] Free VRAM before fresh model load: {free_vram:.2f} GB")
+        if free_vram < 9.0:
+            print("[REINSTALL] WARNING: Less than 9GB free. Risk of OOM. Delete trained model first.")
+
+    # Fresh base model, completely untrained.
+    # Explicit float32 matches training precision for fair comparison.
     fresh_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=torch.float32
+        torch_dtype=torch.float32
     ).to(device)
     fresh_model = fresh_model.float()
     fresh_model.eval()
@@ -395,9 +414,11 @@ def reinstall_graft_and_evaluate(graft_path, meta_path, eval_loader, desc):
     print("[REINSTALL] Evaluating fresh model AFTER graft installation...")
     ppl_after = evaluate(fresh_model, eval_loader, f"{desc} (Fresh Base + Graft B)")
 
-    # Verify forward pass is standard (no hooks present)
+    # Verify forward pass is standard (no hooks present).
+    # Check all three hook registries including _forward_pre_hooks,
+    # which is what ARWManager uses for the blind forward gate.
     n_hooks = sum(
-        len(m._forward_hooks) + len(m._backward_hooks)
+        len(m._forward_hooks) + len(m._backward_hooks) + len(m._forward_pre_hooks)
         for m in fresh_model.modules()
     )
     print(f"[REINSTALL] Active hooks on reinstalled model: {n_hooks} (must be 0)")
@@ -446,6 +467,16 @@ ppl_A_ablat = ablation_correct(model, eval_A, Pi_B, weights_post_A, "Domain A (B
 
 print("\n>>> STAGE 4: Graft Extraction")
 graft, meta = extract_graft(model, weights_post_A, Pi_B, GRAFT_PATH, GRAFT_META_PATH)
+
+# Issue 4: Free the trained model from VRAM before reinstallation test.
+# Two Qwen 3.5 2B float32 models cannot coexist on a single GPU (~8-10GB each).
+print("\n>>> Freeing trained model from VRAM before reinstallation...")
+del model
+del optimizer
+torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    free_vram = torch.cuda.mem_get_info()[0] / (1024**3)
+    print(f"[VRAM] Free after cleanup: {free_vram:.2f} GB")
 
 print("\n>>> STAGE 5: Graft Reinstallation (End-to-End Proof)")
 ppl_fresh_before, ppl_fresh_after = reinstall_graft_and_evaluate(
