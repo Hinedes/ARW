@@ -116,19 +116,12 @@ def compress_graft(delta: torch.Tensor, P: torch.Tensor, layer_type: str) -> tor
         raise ValueError(f"Unknown layer_type {layer_type}")
 
 def decompress_graft(G: torch.Tensor, P: torch.Tensor, layer_type: str) -> torch.Tensor:
-    """
-    Reconstruct full delta from compressed graft G.
-    For left: Δ = G @ P.T
-    For right: Δ = P @ G
-    """
     G = G.to(torch.float32)
     P = P.to(torch.float32)
     if layer_type == 'left':
-        return (G @ P.T).cpu()
+        return (G @ P.T)          # <-- remove .cpu()
     elif layer_type == 'right':
-        return (P @ G).cpu()
-    else:
-        raise ValueError(f"Unknown layer_type {layer_type}")
+        return (P @ G)            # <-- remove .cpu()
 
 # ----------------------------------------------------------------------
 # 6. Utility: filter trainable FFN layers (gate/up/down) by name
