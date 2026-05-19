@@ -28,25 +28,48 @@ def load_jsonl_texts(path):
     return texts
 
 class InfiniteTextDataset(Dataset):
-    """Yields tokenized chunks of max_len from a list of texts, cycling forever."""
-    def __init__(self, texts, tokenizer, max_len=1024):
+    """
+    Yields tokenized chunks of max_len from a list of texts, cycling forever.
+    Engineered with strict vocabulary bounds for Qwen 3.5's multimodal early fusion.
+    """
+    def __init__(self, texts, tokenizer, max_len=1024, vocab_limit=151935):
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.vocab_limit = vocab_limit
         self.data = []
+        
+        # Architecture safety: Fallback to EOS if PAD is completely missing from config
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
         for t in texts:
             ids = tokenizer.encode(t, add_special_tokens=False)
             if ids:
                 self.data.append(ids)
+
     def __len__(self):
         return len(self.data)
+
     def __getitem__(self, idx):
+        # Cycle forever via modulo
         ids = self.data[idx % len(self.data)]
+        
         if len(ids) > self.max_len:
-            start = torch.randint(0, len(ids)-self.max_len, (1,)).item()
-            ids = ids[start:start+self.max_len]
+            # +1 ensures the upper bound is mathematically inclusive if len(ids) is exactly max_len + 1
+            start = torch.randint(0, len(ids) - self.max_len + 1, (1,)).item()
+            ids = ids[start : start + self.max_len]
         else:
-            ids = ids + [self.tokenizer.pad_token_id]*(self.max_len-len(ids))
-        return torch.tensor(ids, dtype=torch.long)
+            # Pad to right
+            ids = ids + [self.pad_id] * (self.max_len - len(ids))
+            
+        tensor_ids = torch.tensor(ids, dtype=torch.long)
+        
+        # CRITICAL FIX: The Qwen 3.5 Multimodal Bumper
+        # Clamps the tokens strictly to the standard text space (0 -> 151,935).
+        # This acts as a physical wall, stopping out-of-bounds IDs from hitting the uninitialized 
+        # 248,320 vision-token embeddings and blowing up your forward pass with NaNs.
+        tensor_ids = torch.clamp(tensor_ids, max=self.vocab_limit)
+        
+        return tensor_ids
 
 # ----------------------------------------------------------------------
 # 2. Acoustic training (single graft)
@@ -67,6 +90,9 @@ def train_graft(model, tokenizer, basis_P, in_texts, out_texts,
     grafted_modules = {}
     for mod_name, module in model.named_modules():
         if isinstance(module, nn.Linear):
+        # Skip MoE routers and DeltaNet recurrent projections
+            if any(kw in mod_name.lower() for kw in ["router", "gate_proj_delta", "recurrent"]):
+                continue
             for pname in ['weight']:
                 full = f"{mod_name}.{pname}"
                 if full in trainer.layer_types:
@@ -199,11 +225,10 @@ def evaluate_ppl(model, tokenizer, texts, max_len=512, device='cuda'):
 # 5. RMSNorm scale measurement
 # ----------------------------------------------------------------------
 def measure_rmsnorm_stats(model, tokenizer, texts, device='cuda', max_len=512):
-    """Returns dict: layer_name -> mean RMS of input (averaged over tokens)."""
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
     rms_modules = {}
     for name, module in model.named_modules():
-        if isinstance(module, Qwen2RMSNorm):
+        # Duck-type: catch any RMSNorm, from any custom modeling file
+        if "RMSNorm" in module.__class__.__name__:
             rms_modules[name] = module
 
     # hook to capture input
@@ -259,7 +284,7 @@ def main():
     domain_names = [os.path.splitext(os.path.basename(f))[0] for f in args.domain_files]
     print(f"Domains: {list(zip(domain_names, [len(d) for d in domains]))}")
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float32, trust_remote_code=True)
     hidden_dim = model.config.hidden_size
     P = make_arw_basis(hidden_dim, args.rank, args.seed, device)
 
@@ -298,13 +323,13 @@ def main():
     print("\n=== Stack Evaluation ===")
     for eval_i, eval_name in enumerate(domain_names):
         # 1. Single-graft (only its own graft)
-        fresh_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, trust_remote_code=True)
+        fresh_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float32, trust_remote_code=True)
         install_grafts(fresh_model, grafts[eval_i], P, layer_types_all, device)
         ppl_single = evaluate_ppl(fresh_model, tokenizer, domains[eval_i][:100], device=device)  # sample 100 texts
         rms_single = measure_rmsnorm_stats(fresh_model, tokenizer, domains[eval_i][:10], device=device)
 
         # 2. Full stack (all grafts)
-        stacked_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, trust_remote_code=True)
+        stacked_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float32, trust_remote_code=True)
         for g in grafts:
             install_grafts(stacked_model, g, P, layer_types_all, device)
         ppl_stacked = evaluate_ppl(stacked_model, tokenizer, domains[eval_i][:100], device=device)
